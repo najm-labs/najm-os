@@ -34,6 +34,7 @@
 //! explaining exactly what invariant makes it sound, and is worth reading
 //! closely rather than trusting on faith.
 
+use crate::serial_println;
 use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -357,8 +358,29 @@ struct Scheduler {
     /// moves the heap allocation the pointer refers to.
     ready_queue: VecDeque<Box<Task>>,
     /// The task presently running - `None` only before the very first
-    /// switch (see `start`).
+    /// switch (see `run_until_idle`), and after the last task exits.
     current: Option<Box<Task>>,
+    /// A task that has called `exit_task` and is waiting to be freed.
+    ///
+    /// It cannot be freed at the moment it exits, because at that moment
+    /// the CPU is still *executing on its stack* - `dealloc` would hand
+    /// the allocator back memory that the very next instruction still
+    /// reads from. So the exiting task parks itself here, switches away,
+    /// and whichever context runs next frees it from a stack it does not
+    /// own. Exactly one slot is enough because only one task can be
+    /// mid-exit at a time on a single core, and the next exit cannot
+    /// begin until some other task has run - which is precisely when the
+    /// previous zombie gets reaped.
+    zombie: Option<Box<Task>>,
+    /// Where to resume the boot context when the last task exits. Written
+    /// by `run_until_idle` before it switches away, and used as the
+    /// switch target when `exit_task` finds the ready queue empty.
+    ///
+    /// Zero means "no boot context to return to" - which is the case when
+    /// the scheduler was entered via `start()` rather than
+    /// `run_until_idle()`, and makes the last task's exit a halt instead
+    /// of a return.
+    boot_stack_pointer: u64,
 }
 
 impl Scheduler {
@@ -366,6 +388,8 @@ impl Scheduler {
         Scheduler {
             ready_queue: VecDeque::new(),
             current: None,
+            zombie: None,
+            boot_stack_pointer: 0,
         }
     }
 }
@@ -412,6 +436,32 @@ pub fn spawn_with_context(entry: extern "C" fn(*mut u8) -> !, context: *mut u8) 
 /// returns immediately without switching anywhere - "yielding" to no one
 /// is a no-op, not an error.
 pub fn yield_now() {
+    yield_inner(SwitchKind::Voluntary)
+}
+
+/// The `yield` *syscall*'s entry point - identical to `yield_now` except
+/// that "no task is running" is a quiet no-op rather than a panic.
+///
+/// The distinction is not pedantic; conflating the two was a real bug.
+/// `yield_now` panics when nothing is current because a *kernel* task
+/// calling it in that state means the scheduler's bookkeeping is broken,
+/// and continuing would corrupt a stack. But the same condition reached
+/// through a syscall means something entirely different and entirely
+/// routine: a Ring 3 program launched directly from the boot context,
+/// before the scheduler owns the CPU, asked to yield. There is nothing to
+/// yield to and nothing wrong.
+///
+/// Routing a user program's request into the panicking path made
+/// `yield()` a one-instruction kernel panic available to any program on
+/// the system - a denial of service with no privileges required. The rule
+/// this encodes: **a syscall handler may never reach a `panic!` that a
+/// user program controls the trigger for.** Invalid input from Ring 3 is
+/// an error to return, never a reason to stop the machine.
+pub fn yield_from_syscall() {
+    yield_inner(SwitchKind::VoluntaryFromUser)
+}
+
+fn yield_inner(kind: SwitchKind) {
     let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
 
     // Interrupts stay off from here until after the switch completes.
@@ -431,7 +481,7 @@ pub fn yield_now() {
     // at the end of the block - i.e. squarely inside window 2.
     x86_64::instructions::interrupts::disable();
 
-    let switch = plan_switch(SwitchKind::Voluntary);
+    let switch = plan_switch(kind);
 
     match switch {
         Some((current_stack_out, next_stack)) => {
@@ -500,7 +550,14 @@ pub fn preempt() {
 /// Whether a switch was asked for by the running task or forced on it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SwitchKind {
+    /// A kernel task called `yield_now()`. "Nothing is current" is a
+    /// broken invariant here and panics.
     Voluntary,
+    /// A Ring 3 program made the `yield` syscall. "Nothing is current" is
+    /// routine - see `yield_from_syscall`.
+    VoluntaryFromUser,
+    /// The timer took the CPU away. "Nothing is current" is the normal
+    /// case during boot.
     Preemptive,
 }
 
@@ -536,6 +593,10 @@ fn plan_switch(kind: SwitchKind) -> Option<(*mut u64, u64)> {
                 // The timer ticks throughout boot, before any task is
                 // running. Nothing to preempt is the normal case.
                 SwitchKind::Preemptive => None,
+                // A user program yielding before the scheduler owns the
+                // CPU. Also normal, and - critically - never a reason to
+                // panic: the trigger is under a Ring 3 program's control.
+                SwitchKind::VoluntaryFromUser => None,
                 SwitchKind::Voluntary => panic!(
                     "yield_now() called with no current task running - \
                      only call this from within a task started via spawn()+start()"
@@ -559,15 +620,193 @@ fn plan_switch(kind: SwitchKind) -> Option<(*mut u64, u64)> {
     Some((current_stack_out, next_stack))
 }
 
+/// Ends the calling task permanently and switches to whatever runs next.
+///
+/// This is what a task's entry point should call instead of parking in
+/// `halt_loop()` forever. The difference is not cosmetic: a parked task
+/// stays in the ready queue, gets scheduled, and burns a time slice doing
+/// nothing, for as long as the machine is on. Worse, it means the
+/// scheduler can never observe "everything finished", which is exactly
+/// the observation the boot self-tests need in order to report a verdict
+/// and shut down.
+///
+/// The subtle part is that a task cannot free its own stack: the CPU is
+/// still executing on it. So the exiting task hands itself to
+/// `Scheduler::zombie` and lets the *next* context free it - see that
+/// field's documentation.
+///
+/// # Panics
+/// If called when no task is current, which would mean something outside
+/// a task tried to exit one.
+pub fn exit_task() -> ! {
+    // Interrupts stay off through the whole sequence, for the same reason
+    // `yield_now` disables them: a tick landing between "the scheduler
+    // says the next task is current" and "the CPU is actually on the next
+    // task's stack" would let `preempt` save this dying stack pointer
+    // into a task that has not started running.
+    x86_64::instructions::interrupts::disable();
+
+    let (next_stack, reaped) = {
+        let mut scheduler = SCHEDULER.lock();
+
+        let dying = scheduler
+            .current
+            .take()
+            .expect("exit_task() called with no task running");
+
+        // Reap the *previous* zombie before becoming one. Safe to do from
+        // here because that allocation belongs to some other, already-
+        // dead task - never to the stack currently executing.
+        let reaped = scheduler.zombie.replace(dying);
+
+        match scheduler.ready_queue.pop_front() {
+            Some(next) => {
+                let next_stack = next.stack_pointer;
+                scheduler.current = Some(next);
+                (next_stack, reaped)
+            }
+            None => {
+                // The last task just ended. Return to the boot context if
+                // one is waiting (`run_until_idle`), otherwise there is
+                // nowhere to go.
+                (scheduler.boot_stack_pointer, reaped)
+            }
+        }
+    };
+
+    // Dropped after the scheduler lock is released, so a heap free cannot
+    // be taken while holding it.
+    drop(reaped);
+
+    if next_stack == 0 {
+        // Entered via `start()`, which promised never to return, and no
+        // other task is ready. Nothing left to switch to.
+        serial_println!(
+            "Najm Kernel: last task exited and no boot context was saved - halting"
+        );
+        crate::halt_loop();
+    }
+
+    // A scratch slot for the outgoing stack pointer that is deliberately
+    // never read. It lives on the dying task's own stack, which is still
+    // allocated (this task is the zombie now, and nothing frees a zombie
+    // until after the switch completes), so the write is in-bounds.
+    let mut discarded: u64 = 0;
+
+    // Safety: `next_stack` is either a `Task` the line above placed into
+    // `scheduler.current` or the boot stack pointer `run_until_idle`
+    // saved - both are exactly what `context_switch`'s contract requires.
+    // `discarded` is a valid local to write through.
+    unsafe {
+        context_switch(&mut discarded, next_stack);
+    }
+
+    unreachable!("a task resumed after exit_task() switched away from it");
+}
+
+/// Frees any task that has exited since the last time this was called.
+///
+/// Called from the boot context after `run_until_idle` returns, where
+/// interrupts are on and no scheduler lock is held - the safest possible
+/// place to touch the heap.
+fn reap_zombie() {
+    let zombie = x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().zombie.take());
+    drop(zombie);
+}
+
+/// How many tasks are queued or running right now. Reported by the boot
+/// self-tests so "the scheduler drained" is an observation rather than an
+/// assumption.
+pub fn task_count() -> usize {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let scheduler = SCHEDULER.lock();
+        scheduler.ready_queue.len() + usize::from(scheduler.current.is_some())
+    })
+}
+
+/// Runs every spawned task until they have all called `exit_task`, then
+/// returns to the caller.
+///
+/// This is the counterpart `start()` never had. `start()` is a one-way
+/// trip: it abandons the boot context, so there is no way for the kernel
+/// to do anything *after* the tasks are done - no summary, no verdict, no
+/// shutdown. That was tolerable while the tasks were three test loops
+/// whose output a human read; it is not tolerable now that the boot log
+/// is meant to be machine-checkable (`scripts/boot-test.sh`).
+///
+/// The mechanism is the same `context_switch` as everywhere else, applied
+/// to the boot context: its stack pointer is saved into
+/// `Scheduler::boot_stack_pointer` on the way out, and `exit_task` uses
+/// that as its switch target when the ready queue is empty. The boot
+/// context therefore behaves exactly like a task that is never in the
+/// ready queue and is only ever resumed last.
+pub fn run_until_idle() {
+    let next_stack = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut scheduler = SCHEDULER.lock();
+        match scheduler.ready_queue.pop_front() {
+            Some(next) => {
+                let next_stack = next.stack_pointer;
+                scheduler.current = Some(next);
+                Some(next_stack)
+            }
+            // No tasks at all is not an error here (unlike `start()`,
+            // where it left the machine with nothing to do) - there is
+            // simply nothing to run, and returning immediately is the
+            // correct answer.
+            None => None,
+        }
+    });
+
+    let Some(next_stack) = next_stack else {
+        return;
+    };
+
+    // Interrupts off across the switch, for the reason spelled out in
+    // `yield_now`: the window between the scheduler declaring `next`
+    // current and the CPU actually being on `next`'s stack must not be
+    // interruptible.
+    let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
+    x86_64::instructions::interrupts::disable();
+
+    // Safety: `next_stack` came from a `Task` just placed into
+    // `scheduler.current` (heap-stable per the `Box<Task>` reasoning in
+    // `Scheduler`). The pointer written to is a field of a `static`
+    // behind a lock, valid for the whole life of the kernel; taking the
+    // lock again here would deadlock against the switch, so the address
+    // is captured while holding it and written to by assembly afterwards
+    // - the field is only ever read by `exit_task`, which cannot run
+    // until after this write has happened.
+    unsafe {
+        let boot_slot = {
+            let mut scheduler = SCHEDULER.lock();
+            &mut scheduler.boot_stack_pointer as *mut u64
+        };
+        context_switch(boot_slot, next_stack);
+    }
+
+    // Reached only when the last task called `exit_task`.
+    if interrupts_were_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    reap_zombie();
+}
+
 /// Performs the one-time transition from the kernel's own boot context
 /// into task-based execution, then never returns.
+///
+/// Kept alongside `run_until_idle` rather than replaced by it, because
+/// the two describe genuinely different intents: this one is what a
+/// finished OS does at the end of boot (hand the machine over and never
+/// come back), while `run_until_idle` is what a *test* boot does (run the
+/// work, then report). Deleting this would mean the eventual real boot
+/// path had to be re-derived from the test path.
 ///
 /// Unlike `yield_now`, there is no "current task" for the boot context to
 /// be saved *as* - kernel_main's stack was set up by the bootloader, not
 /// by `Task::new`, and isn't going to be resumed later. Its final stack
 /// pointer is written somewhere harmless and then never read again; this
 /// is a deliberate one-way trip, not an oversight.
-///
+#[allow(dead_code)]
 pub fn start() -> ! {
     // Same lock discipline as `spawn`: a timer tick between taking this
     // lock and releasing it would deadlock against `preempt`.
@@ -594,8 +833,5 @@ pub fn start() -> ! {
         context_switch(&mut discarded_boot_stack, next_stack);
     }
 
-    unreachable!(
-        "a task switched back into the abandoned boot context - this should be impossible \
-         in a purely cooperative scheduler with no way to resume it"
-    );
+    crate::halt_loop()
 }

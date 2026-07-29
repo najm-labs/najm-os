@@ -96,6 +96,12 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
 /// currently only ever one program running, so that gap isn't reachable
 /// yet, but it closes properly only when address spaces become per-Realm.
 pub fn user_range_is_accessible(start: u64, len: u64) -> bool {
+    range_is_user(start, len, false)
+}
+
+/// The shared implementation behind `user_range_is_accessible` and
+/// `user_range_is_writable`. See both for what each is for.
+fn range_is_user(start: u64, len: u64, require_writable: bool) -> bool {
     if len == 0 {
         // An empty range is trivially in-bounds. Checked explicitly
         // because `start + len - 1` would underflow below.
@@ -107,6 +113,17 @@ pub fn user_range_is_accessible(start: u64, len: u64) -> bool {
         // buffer could never have.
         return false;
     };
+
+    // The address-space rule, checked before and separately from the page
+    // table walk below. The walk alone would reject a kernel address only
+    // as a side effect of the kernel's pages not carrying
+    // USER_ACCESSIBLE - true today, but an emergent property of how those
+    // mappings happen to be flagged rather than a stated policy. Stating
+    // it means a single mis-flagged kernel page cannot turn into a read
+    // primitive. See `mm::layout::is_user_address`.
+    if !crate::mm::layout::is_user_address(start) || !crate::mm::layout::is_user_address(last) {
+        return false;
+    }
 
     let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst);
     if offset == OFFSET_UNINITIALIZED {
@@ -132,7 +149,7 @@ pub fn user_range_is_accessible(start: u64, len: u64) -> bool {
         // that mapping is exactly what `BOOTLOADER_CONFIG` requests. Only
         // shared reads happen through it; nothing here mutates a page
         // table or forms a `&mut` that could alias `kernel_main`'s.
-        if !unsafe { page_is_user_accessible(addr, offset) } {
+        if !unsafe { page_is_user_accessible(addr, offset, require_writable) } {
             return false;
         }
 
@@ -155,7 +172,11 @@ pub fn user_range_is_accessible(start: u64, len: u64) -> bool {
 /// `physical_memory_offset` must be the bootloader's physical-memory
 /// mapping offset, so that physical frame addresses can be read through
 /// it.
-unsafe fn page_is_user_accessible(addr: VirtAddr, physical_memory_offset: VirtAddr) -> bool {
+unsafe fn page_is_user_accessible(
+    addr: VirtAddr,
+    physical_memory_offset: VirtAddr,
+    require_writable: bool,
+) -> bool {
     use x86_64::registers::control::Cr3;
 
     let (level_4_frame, _) = Cr3::read();
@@ -176,6 +197,16 @@ unsafe fn page_is_user_accessible(addr: VirtAddr, physical_memory_offset: VirtAd
             return false;
         }
 
+        // WRITABLE is checked at every level for the same reason
+        // USER_ACCESSIBLE is: on x86_64 the effective permission for a
+        // page is the *conjunction* of the flags along its entire path,
+        // so a leaf marked writable beneath a read-only parent is not
+        // actually writable. Requiring it at each level matches how the
+        // hardware resolves it rather than approximating.
+        if require_writable && !flags.contains(PageTableFlags::WRITABLE) {
+            return false;
+        }
+
         // A huge page ends the walk early - the translation is already
         // resolved, and its flags (just checked) are the ones that
         // govern it. Only meaningful at the L3/L2 levels: at L1 the same
@@ -189,6 +220,225 @@ unsafe fn page_is_user_accessible(addr: VirtAddr, physical_memory_offset: VirtAd
     }
 
     true
+}
+
+/// The largest single buffer a syscall will copy in or out.
+///
+/// A limit is required, not merely prudent. `copy_from_user` allocates a
+/// kernel buffer sized by a length the *caller* chose; without a cap, a
+/// user program asks for a 100 GiB write and the kernel either exhausts
+/// its heap trying to honour it or panics in the allocator. Both are a
+/// denial of service handed out through a perfectly ordinary syscall.
+/// 1 MiB is comfortably larger than any legitimate single call today and
+/// small enough that even a program calling it in a tight loop cannot
+/// outrun the heap.
+pub const MAX_USER_TRANSFER: usize = 1024 * 1024;
+
+/// Copies `len` bytes out of a user buffer into kernel memory.
+///
+/// This, not raw pointer arithmetic, is how a syscall should read a user
+/// buffer. Two things it does that a bare `from_raw_parts` at the call
+/// site would not:
+///
+/// 1. It validates the *whole* range against the page tables first (see
+///    `user_range_is_accessible`), so there is exactly one place that
+///    check can be forgotten rather than one per syscall.
+/// 2. It **copies**, rather than lending the kernel a reference into
+///    memory the user still controls. That distinction matters more than
+///    it looks: a borrowed user buffer is a time-of-check/time-of-use
+///    hazard the moment anything can run between the check and the use -
+///    another thread in the same address space, or a page fault handler,
+///    could change the bytes after they were validated but before they
+///    were acted on. Copying collapses check and use into one moment.
+///    Today this kernel is single-core with no user threads, so the race
+///    is not yet reachable; building the interface to be safe *now* is
+///    much cheaper than auditing every syscall for it later.
+pub fn copy_from_user(ptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    if len > MAX_USER_TRANSFER {
+        return None;
+    }
+    if !user_range_is_accessible(ptr, len as u64) {
+        return None;
+    }
+
+    let mut buffer = alloc::vec::Vec::with_capacity(len);
+
+    // Safety: `user_range_is_accessible` has just confirmed every page of
+    // `ptr..ptr + len` is present and user-accessible in the active page
+    // tables, so the read is in-bounds and cannot fault. `buffer` has
+    // capacity for exactly `len` bytes and the two regions cannot overlap
+    // (one is user memory in the lower half, the other a kernel heap
+    // allocation in the higher half).
+    unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, buffer.as_mut_ptr(), len);
+        buffer.set_len(len);
+    }
+
+    Some(buffer)
+}
+
+/// Copies `bytes` into a user buffer, returning how many were written.
+///
+/// Refuses rather than truncating silently if the destination is not a
+/// writable user range: a partial write to a buffer the program cannot
+/// actually see would be indistinguishable, from userland, from a
+/// successful one.
+pub fn copy_to_user(ptr: u64, bytes: &[u8]) -> Option<usize> {
+    if bytes.len() > MAX_USER_TRANSFER {
+        return None;
+    }
+    if !user_range_is_writable(ptr, bytes.len() as u64) {
+        return None;
+    }
+
+    // Safety: `user_range_is_writable` has just confirmed every page of
+    // the destination is present, user-accessible and writable. The
+    // source is a kernel slice, and kernel and user memory are in
+    // different halves of the address space, so they cannot overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+    }
+
+    Some(bytes.len())
+}
+
+/// Like `user_range_is_accessible`, but also requires every page to be
+/// writable.
+///
+/// A separate function rather than a flag argument, so that a call site
+/// reading `user_range_is_writable(...)` states which of the two checks
+/// it wanted. Writing through a range that was only validated as
+/// *readable* would let a user program get the kernel to write into its
+/// own read-only pages - which, on a page marked read-only precisely
+/// because it holds a program's code, is a W^X bypass with the kernel as
+/// the confused deputy.
+pub fn user_range_is_writable(start: u64, len: u64) -> bool {
+    range_is_user(start, len, true)
+}
+
+/// How many top-level (PML4) entries are present in each half of the
+/// address space right now: `(lower_half, higher_half)`.
+///
+/// Exists to *verify* the split `mm::layout` describes rather than assume
+/// it. `BOOTLOADER_CONFIG` asks the bootloader to place every dynamic
+/// mapping above `layout::HIGHER_HALF_START`, but a request is not a
+/// guarantee - a future bootloader version could ignore the field, or a
+/// mapping this kernel makes itself could land in the wrong half by
+/// accident. Either way the symptom would not be a crash: it would be
+/// per-process address spaces silently sharing a page table entry with
+/// the kernel, which is a security boundary quietly ceasing to exist.
+/// Counting the entries is a two-line check that turns that into a
+/// visible boot-time failure.
+pub fn pml4_entries_in_use() -> (usize, usize) {
+    use x86_64::registers::control::Cr3;
+
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst);
+    assert_ne!(
+        offset, OFFSET_UNINITIALIZED,
+        "pml4_entries_in_use called before memory::init"
+    );
+
+    let (frame, _) = Cr3::read();
+    let table_virt = VirtAddr::new(offset) + frame.start_address().as_u64();
+
+    // Safety: `offset` is the bootloader's physical-memory mapping offset
+    // recorded by `init`, so this address reads the active PML4 through
+    // that mapping. A shared reference only - nothing here mutates a page
+    // table or aliases the `&mut` that `kernel_main`'s `OffsetPageTable`
+    // holds.
+    let table: &PageTable = unsafe { &*table_virt.as_ptr() };
+
+    let mut lower = 0;
+    let mut higher = 0;
+    for (index, entry) in table.iter().enumerate() {
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            continue;
+        }
+        if index < crate::mm::layout::KERNEL_PML4_FIRST_INDEX {
+            lower += 1;
+        } else {
+            higher += 1;
+        }
+    }
+
+    (lower, higher)
+}
+
+/// Removes every lower-half mapping the bootloader left behind, and
+/// reports which top-level entries were cleared.
+///
+/// There is normally exactly one. A bootloader cannot simply load CR3
+/// with the kernel's new page table and carry on - the very next
+/// instruction fetch would come from an address that table does not map,
+/// which is an instant triple fault. The standard solution, and the one
+/// `bootloader` 0.11 uses, is to identity-map the small stub that
+/// performs the switch, so that the same physical address is valid before
+/// and after. That leaves one PML4 entry covering low memory pointing at
+/// bootloader code the kernel has long since stopped needing.
+///
+/// Harmless in a kernel with a single address space. Not harmless here:
+/// per-process address spaces are built by giving each process its own
+/// lower half, and an inherited entry there would be a page of *someone
+/// else's* memory mapped into every process, at a low address, executable
+/// (nothing sets NX on it), for the entire life of the machine. That is a
+/// gadget source and an information leak, handed to every program on the
+/// system, for no benefit at all - the code it maps can never run again.
+///
+/// So it is unmapped rather than tolerated. The frames themselves are not
+/// returned to the allocator: they sit in regions the bootloader marked
+/// as its own rather than `Usable`, so the frame allocator was never
+/// going to hand them out anyway, and pretending to free memory this
+/// module does not own would be worse than leaving a few pages of low
+/// memory unused forever.
+///
+/// # Safety
+/// Nothing may still be executing from, or holding a pointer into, any
+/// lower-half address. In practice that means this must run before the
+/// first user process is created and after the kernel has switched to its
+/// own stack - both true at the point `kernel_main` calls it.
+pub unsafe fn clear_lower_half_mappings() -> alloc::vec::Vec<usize> {
+    use x86_64::registers::control::Cr3;
+
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst);
+    assert_ne!(
+        offset, OFFSET_UNINITIALIZED,
+        "clear_lower_half_mappings called before memory::init"
+    );
+
+    let (frame, flags) = Cr3::read();
+    let table_virt = VirtAddr::new(offset) + frame.start_address().as_u64();
+
+    // Safety: forwarded from this function's contract. `table_virt`
+    // reaches the active PML4 through the bootloader's physical-memory
+    // mapping, and this is the only `&mut` to it in existence for the
+    // duration of this function - `kernel_main`'s `OffsetPageTable` is
+    // not borrowed across this call.
+    let table: &mut PageTable = unsafe { &mut *table_virt.as_mut_ptr() };
+
+    let mut cleared = alloc::vec::Vec::new();
+    for index in 0..crate::mm::layout::KERNEL_PML4_FIRST_INDEX {
+        if table[index].flags().contains(PageTableFlags::PRESENT) {
+            table[index].set_unused();
+            cleared.push(index);
+        }
+    }
+
+    if !cleared.is_empty() {
+        // Reloading CR3 flushes the entire TLB, which is what makes the
+        // removal take effect. A targeted `invlpg` is not usable here:
+        // clearing a top-level entry invalidates an enormous range
+        // (512 GiB per entry), and there is no instruction that
+        // invalidates a range rather than a page.
+        //
+        // Safety: writing back the value just read, with the same flags -
+        // this changes nothing about which table is active, and exists
+        // purely for its TLB-flushing side effect.
+        unsafe {
+            Cr3::write(frame, flags);
+        }
+    }
+
+    cleared
 }
 
 /// Hands out unused physical frames from the memory map the bootloader

@@ -49,14 +49,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
-/// Arbitrary, fixed virtual address for the one-page test payload -
-/// chosen to sit well clear of the kernel heap (`allocator::HEAP_START`)
-/// and every other fixed range this kernel already uses, the same
-/// approach `allocator.rs` takes for its own heap range.
-const USER_CODE_ADDR: u64 = 0x_5555_5555_0000;
+/// Fixed virtual address for the one-page test payload. Defined in
+/// `mm::layout` alongside every other fixed range, rather than here -
+/// see that module for why a scattered set of `const`s stopped being
+/// good enough once the address space acquired two halves with different
+/// ownership rules.
+const USER_CODE_ADDR: u64 = crate::mm::layout::USERMODE_TEST_CODE;
 
 /// Same reasoning, for the one-page user stack.
-const USER_STACK_ADDR: u64 = 0x_6666_6666_0000;
+const USER_STACK_ADDR: u64 = crate::mm::layout::USERMODE_TEST_STACK;
 
 /// Hand-assembled machine code, not compiled from a Rust function -
 /// deliberately. Extracting the exact byte range of an arbitrary

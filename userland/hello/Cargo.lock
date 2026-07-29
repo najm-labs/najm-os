@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "najm-abi"
+version = "0.1.0"
+
+[[package]]
 name = "najm-hello"
 version = "0.1.0"
+dependencies = [
+ "najm-abi",
+]

@@ -26,7 +26,15 @@ USERLAND_MANIFEST   := userland/hello/Cargo.toml
 USERLAND_BIN_DEBUG   := $(CURDIR)/userland/hello/target/$(KERNEL_TARGET)/debug/najm-hello
 USERLAND_BIN_RELEASE := $(CURDIR)/userland/hello/target/$(KERNEL_TARGET)/release/najm-hello
 
-.PHONY: build userland run run-release run-no-kvm check clean
+.PHONY: build userland run run-release run-no-kvm check clean test
+
+## The closest thing this project has to `cargo test`: build everything,
+## boot it headless, and judge the run from the kernel's own self-test
+## output. The kernel shuts the machine down itself when it finishes (see
+## drivers/qemu.rs), so this terminates on its own rather than on a
+## timeout. Exit status is the verdict - usable from CI or a git hook.
+test:
+	./scripts/boot-test.sh
 
 ## Compile the kernel only (debug profile), without launching QEMU.
 build:

@@ -122,5 +122,14 @@ extern "C" fn realm_task_entry(context_ptr: *mut u8) -> ! {
         task::yield_now();
     }
 
-    crate::halt_loop();
+    // Exiting rather than parking means this task's stack is freed and
+    // the scheduler can eventually observe that nothing is left to run.
+    // The `RealmContext` this task owns is dropped here too, on the way
+    // out - `Box::from_raw` above took ownership of it, so letting it
+    // fall out of scope at the end of the task is what reclaims it.
+    // Before `exit_task` existed, a finished Realm task parked forever
+    // and leaked its context; that is now genuinely fixed rather than
+    // documented.
+    drop(context);
+    task::exit_task();
 }

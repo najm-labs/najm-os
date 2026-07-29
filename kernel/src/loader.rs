@@ -34,7 +34,7 @@ const PT_LOAD: u32 = 1;
 /// from `usermode::run_test`'s own hardcoded test range, so the two
 /// mechanisms can't collide now that both run in the same boot (see the
 /// call sites in main.rs).
-const USER_STACK_ADDR: u64 = 0x_6666_6667_0000;
+const USER_STACK_ADDR: u64 = crate::mm::layout::USER_STACK_BOTTOM;
 
 /// How many pages the user stack gets.
 ///
@@ -53,7 +53,7 @@ const USER_STACK_ADDR: u64 = 0x_6666_6667_0000;
 /// cleanly. That's the same gap task stacks have, and it needs the same
 /// fix (per-program page tables), so it's recorded here rather than
 /// solved locally.
-const USER_STACK_PAGES: u64 = 4;
+const USER_STACK_PAGES: u64 = crate::mm::layout::USER_STACK_PAGES;
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())

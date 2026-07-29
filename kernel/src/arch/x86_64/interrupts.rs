@@ -26,10 +26,11 @@ use super::usermode::{self, ProgramExit};
 use crate::serial_print;
 use crate::serial_println;
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
+use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 /// The 8259 PIC has two chained controllers (primary + secondary), each
@@ -63,11 +64,83 @@ impl InterruptIndex {
     }
 }
 
-/// Ticks since the timer interrupt was enabled. Deliberately just a
-/// counter for now, not driving anything - the eventual scheduler reads
-/// this (or a mechanism like it) to decide when to preempt, but no
-/// scheduler exists yet to do that.
+/// Ticks since the timer interrupt was enabled. Drives preemption (see
+/// `sched::task::preempt`) and every time-based measurement the kernel
+/// makes.
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times per second the PIT fires.
+///
+/// The PIT's *default* rate, if nothing programs it, is its input
+/// frequency divided by 65536 - about 18.2065 Hz. That is a genuinely
+/// bad number to build on for two separate reasons:
+///
+/// 1. **It is not a round number**, so "how long is a tick?" has no exact
+///    answer in milliseconds, and every duration the kernel reports is
+///    off by a fraction that compounds.
+/// 2. **It is far too slow for a scheduler.** A 55 ms quantum means the
+///    worst case for a task waiting behind one CPU-bound peer is 55 ms of
+///    latency - an eternity against the Gaming Realm's stated
+///    bounded-latency goal (ARCHITECTURE.md section 4), and visible as
+///    stutter to a human.
+///
+/// 100 Hz gives a 10 ms quantum and an exact millisecond conversion. It
+/// is deliberately not 1000 Hz: at that rate the interrupt overhead
+/// starts to matter on emulated hardware, and this kernel does not yet
+/// have the tickless/deadline machinery that makes a high tick rate
+/// worthwhile. This is the number to revisit when the Gaming Realm's
+/// scheduling class gets real deadline enforcement, not before.
+pub const TIMER_HZ: u64 = 100;
+
+/// The PIT's fixed input frequency, in Hz. A hardware constant
+/// (1.193182 MHz, historically derived from the NTSC colour burst
+/// frequency divided by 3) - not a tunable.
+const PIT_INPUT_HZ: u64 = 1_193_182;
+
+/// I/O ports for PIT channel 0.
+const PIT_CHANNEL0_DATA: u16 = 0x40;
+const PIT_COMMAND: u16 = 0x43;
+
+/// Programs PIT channel 0 to fire at [`TIMER_HZ`].
+///
+/// Must run before interrupts are enabled: reprogramming the divisor
+/// while ticks are already arriving would leave one interval at the old
+/// rate, which is harmless but makes the very first timing measurement of
+/// a boot wrong for no reason.
+fn init_pit() {
+    let divisor = PIT_INPUT_HZ / TIMER_HZ;
+    assert!(
+        divisor > 0 && divisor <= u16::MAX as u64,
+        "TIMER_HZ is outside the range the PIT's 16-bit divisor can express"
+    );
+
+    // Safety: 0x43 and 0x40 are the standard, fixed PIT command and
+    // channel-0 data ports on every x86 machine, and this function is the
+    // only code in the kernel that writes them. The command byte 0x36
+    // selects channel 0, access mode "lobyte then hibyte", operating mode
+    // 3 (square wave, which is what a periodic interrupt source wants),
+    // and binary rather than BCD counting - so the two data writes that
+    // follow are exactly the low and high halves of the divisor, in that
+    // order, which is what the access mode just requested.
+    unsafe {
+        let mut command: Port<u8> = Port::new(PIT_COMMAND);
+        let mut data: Port<u8> = Port::new(PIT_CHANNEL0_DATA);
+        command.write(0x36);
+        data.write((divisor & 0xFF) as u8);
+        data.write((divisor >> 8) as u8);
+    }
+}
+
+/// Milliseconds since the timer started, derived from the tick counter.
+///
+/// Exact rather than approximate because [`TIMER_HZ`] divides 1000
+/// evenly - which is one of the reasons that value was chosen. An
+/// assertion is not needed here; a `TIMER_HZ` that did not divide 1000
+/// would simply make this truncate, and the constant's own documentation
+/// is where that constraint belongs.
+pub fn uptime_ms() -> u64 {
+    timer_ticks() * 1000 / TIMER_HZ
+}
 
 /// Current tick count. `Relaxed` ordering is sufficient: this is a
 /// monotonically increasing counter with no other memory operations that
@@ -171,6 +244,10 @@ lazy_static! {
 /// invisible in testing and shows up as an unexplained fault later.
 pub fn init() {
     IDT.load();
+
+    // Before the PICs are initialized and before `sti`, so no tick can
+    // arrive at the old default rate.
+    init_pit();
 
     // Safety: this is the only place `PICS.lock().initialize()` is ever
     // called, and it runs after the line above, so both PIC-driven IDT
@@ -281,25 +358,13 @@ fn end_or_halt_after_fault(stack_frame: InterruptStackFrame, exit: ProgramExit) 
     crate::halt_loop();
 }
 
-/// Syscall numbers, passed by the caller in RAX.
-///
-/// Loosely following Linux's own register convention (RAX = number,
-/// RDI/RSI/RDX = arguments) for familiarity, explicitly *not* for
-/// compatibility - nothing here aims to run Linux binaries, and the
-/// numbers themselves are this kernel's own.
-pub const SYS_EXIT: u64 = 0;
-pub const SYS_WRITE: u64 = 1;
-
-/// Returned in RAX for a syscall number this kernel doesn't implement.
-/// `-1` as a `u64`, in the C tradition of a negative return meaning
-/// failure, since userland has no `Result` to receive here.
-const SYSCALL_UNKNOWN: u64 = u64::MAX;
-
-/// Returned by `write` when the buffer it was handed isn't a range the
-/// calling program is actually allowed to read. Distinct from
-/// `SYSCALL_UNKNOWN` so a program (and anyone reading a boot log) can
-/// tell "no such syscall" from "that pointer was rejected."
-const SYSCALL_BAD_ADDRESS: u64 = u64::MAX - 1;
+// Syscall numbers, error codes, and what each call actually does have all
+// moved out of this file. The numbers live in the `najm-abi` crate, which
+// the kernel and every userland program compile against (see
+// `abi/src/lib.rs`); the handlers live in `crate::syscall`. This file
+// keeps only the mechanism - the naked entry stub below - because that is
+// the part that is architecture-specific and the part that should change
+// almost never.
 
 /// The Ring 3 entry point for `int 0x80` - a naked function, and it has
 /// to be.
@@ -370,6 +435,10 @@ unsafe extern "C" fn syscall_entry() {
         // push would invalidate the value it captures.
         "mov r8, rsp",
         "call {dispatch}",
+        // Anything the dispatcher decided about *which* syscall this was,
+        // and what it should return, lives in crate::syscall - this stub
+        // deliberately knows nothing about it beyond the calling
+        // convention.
         // The dispatcher's return value becomes the user program's RAX,
         // by overwriting the saved copy in place before it's popped.
         "mov [rsp + 64], rax",
@@ -384,150 +453,8 @@ unsafe extern "C" fn syscall_entry() {
         "pop rcx",
         "pop rax",
         "iretq",
-        dispatch = sym syscall_dispatch,
+        dispatch = sym crate::syscall::dispatch,
     );
-}
-
-/// Reports, once per boot, whether `syscall_entry` really did hand the
-/// dispatcher a 16-byte aligned stack.
-///
-/// This exists because stack misalignment is the one mistake in that
-/// hand-written entry stub with no compile-time and almost no runtime
-/// signal: nothing faults, nothing warns, and the damage only appears
-/// later as corrupted data from an aligned SSE move somewhere entirely
-/// unrelated. The arithmetic is spelled out in `syscall_entry`'s docs,
-/// but arithmetic in a comment is a claim, and this project's standard is
-/// to put the claim in the boot log where it can be checked. A wrong
-/// answer here means the push count in `syscall_entry` changed without
-/// its alignment reasoning being redone.
-///
-/// Once per boot rather than per syscall: it's a property of the stub's
-/// instruction sequence, identical on every call, so printing it each
-/// time would be noise rather than evidence.
-fn check_syscall_stack_alignment(rsp_at_call: u64) {
-    static REPORTED: AtomicBool = AtomicBool::new(false);
-
-    if REPORTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let misalignment = rsp_at_call % 16;
-    if misalignment == 0 {
-        serial_println!(
-            "Najm Kernel: syscall entry stack alignment confirmed (RSP {:#x} is 16-byte \
-             aligned at the dispatcher call)",
-            rsp_at_call
-        );
-    } else {
-        serial_println!(
-            "Najm Kernel: SYSCALL STACK MISALIGNED - RSP {:#x} is {} bytes off a 16-byte \
-             boundary at the dispatcher call. The push count in syscall_entry and its \
-             alignment reasoning have drifted apart; SSE spills in any called code may \
-             corrupt silently.",
-            rsp_at_call,
-            misalignment
-        );
-    }
-}
-
-/// Decides what a syscall actually does. An ordinary `extern "C"` Rust
-/// function - all the fragile register and alignment work is confined to
-/// `syscall_entry` above, so that everything from here on is normal, safe
-/// Rust that can be read and changed without thinking about calling
-/// conventions.
-///
-/// Returns the value the calling program receives in RAX. Note that
-/// `SYS_EXIT` never returns at all: it diverts to the supervisor via
-/// `usermode::end_program`, abandoning the interrupt frame rather than
-/// `iretq`-ing back to a program that asked to stop existing.
-extern "C" fn syscall_dispatch(
-    number: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    rsp_at_call: u64,
-) -> u64 {
-    check_syscall_stack_alignment(rsp_at_call);
-
-    match number {
-        SYS_EXIT => {
-            let status = arg1 as u32;
-            serial_println!(
-                "Najm Kernel: syscall exit(status = {}) - program requested termination",
-                status
-            );
-
-            if usermode::program_is_running() {
-                usermode::end_program(ProgramExit::Exited(status));
-            }
-
-            // `exit` from something this kernel never launched as a Ring
-            // 3 program. There's no supervisor context to return to, and
-            // silently continuing would be worse than saying so.
-            serial_println!(
-                "Najm Kernel: exit syscall with no Ring 3 program running - ignoring"
-            );
-            SYSCALL_UNKNOWN
-        }
-
-        SYS_WRITE => {
-            let ptr = arg1;
-            let len = arg2;
-
-            // The security-critical line of this whole file: `ptr` was
-            // chosen by a Ring 3 program, and the kernel is about to read
-            // through it at Ring 0, where the CPU's own user/supervisor
-            // check no longer applies. See
-            // `mm::memory::user_range_is_accessible` for the full
-            // reasoning on why this check is what keeps `write` from
-            // being an arbitrary kernel-memory read primitive.
-            if !crate::mm::memory::user_range_is_accessible(ptr, len) {
-                serial_println!(
-                    "Najm Kernel: syscall write REJECTED - buffer {:#x}..+{} is not a \
-                     user-accessible mapped range",
-                    ptr,
-                    len
-                );
-                return SYSCALL_BAD_ADDRESS;
-            }
-
-            // Safety: `user_range_is_accessible` just confirmed every
-            // page of `ptr..ptr + len` is present and user-accessible in
-            // the active page tables, so this read is in-bounds and
-            // cannot fault. Nothing can unmap it in between - this kernel
-            // is single-core and the only other context that could change
-            // a mapping is the one currently blocked inside this call.
-            let bytes: &[u8] = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-
-            // Written byte-by-byte through `serial_print!` rather than
-            // via `from_utf8`: a user program's buffer is arbitrary
-            // bytes, not guaranteed valid UTF-8, and rejecting a write
-            // for bad encoding would be inventing a rule the syscall
-            // never promised. Non-printable bytes are shown as an escape
-            // rather than sent to the terminal raw, so a program can't
-            // emit control sequences that scramble the kernel's own log.
-            for &byte in bytes {
-                match byte {
-                    b'\n' | b'\t' | 0x20..=0x7e => serial_print!("{}", byte as char),
-                    other => serial_print!("\\x{:02x}", other),
-                }
-            }
-
-            // Same contract as POSIX `write`: the number of bytes taken.
-            len
-        }
-
-        unknown => {
-            serial_println!(
-                "Najm Kernel: unknown syscall number {:#x} (args {:#x}, {:#x}, {:#x})",
-                unknown,
-                arg1,
-                arg2,
-                arg3
-            );
-            SYSCALL_UNKNOWN
-        }
-    }
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {

@@ -10,6 +10,15 @@ description = "Najm Kernel - the freestanding kernel binary at the heart of Najm
 # handed over. The `runner` crate (see ../runner) is what actually wraps
 # this binary in a bootable disk image and launches it under QEMU.
 [dependencies]
+# The kernel/userland contract: syscall numbers, error codes, the shape
+# of every structure that crosses the boundary, and the virtual address
+# map. A path dependency rather than a published crate on purpose - it is
+# this repo's own interface definition, and the whole point is that the
+# kernel and every userland program compile against the *same* copy.
+# Cargo handles a path dependency fine across separate Cargo projects
+# (see the note in runner/Cargo.toml on why these are not one workspace).
+najm-abi = { path = "../abi" }
+
 # Pinned to the EXACT version, not a floating "0.11" - this crate's
 # internal build (see runner/Cargo.toml's own bootloader dependency)
 # pulls in the `x86_64` crate for its own BIOS/UEFI stage binaries, and

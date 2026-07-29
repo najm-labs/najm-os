@@ -1,0 +1,21 @@
+[package]
+name = "najm-abi"
+version = "0.1.0"
+edition = "2021"
+description = "The Najm OS kernel/userland interface contract, shared by both sides"
+
+# Deliberately dependency-free. This crate is compiled into the kernel
+# *and* into every userland program, including ones built by third
+# parties; anything it pulls in becomes part of the trusted surface of
+# both. Constants, plain enums, and `const fn` only - no allocation, no
+# I/O, nothing that needs a runtime.
+[dependencies]
+
+# Consumers are all `panic = "abort"` (a kernel cannot unwind, and
+# userland has no unwinder). Declaring it here too keeps this crate's own
+# profile from disagreeing when it is built standalone.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

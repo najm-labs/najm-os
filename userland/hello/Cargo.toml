@@ -12,6 +12,10 @@ description = "The first real userland program for Najm OS - a compiled, no_std 
 # kernel are the linker script (see build.rs and linker.ld) and the fact
 # that its only way to affect the world is `int 0x80`.
 [dependencies]
+# The kernel/userland contract - syscall numbers, error codes, and the
+# address map. Shared with the kernel rather than duplicated here; see
+# ../../abi/src/lib.rs for why that stopped being optional.
+najm-abi = { path = "../../abi" }
 
 # Nothing to unwind into here either - same reasoning as the kernel's own
 # profile settings. The target already implies `panic-strategy: abort`;

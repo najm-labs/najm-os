@@ -28,3 +28,10 @@ description = "Wraps the najm-kernel binary in a bootable disk image and launche
 # this pin (and kernel/Cargo.toml's matching `x86_64` and `bootloader_api`
 # pins) in the same commit - they all move together, never independently.
 bootloader = "=0.11.15"
+
+# The kernel/userland contract, used here so the hand-encoded fallback ELF
+# (see build.rs) is assembled against the *same* syscall numbers and the
+# same address map the kernel was compiled with. It used to hardcode both,
+# which meant a change to either produced a fallback payload that silently
+# tested the wrong thing - a test failing to fail is worse than no test.
+najm-abi = { path = "../abi" }

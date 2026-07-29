@@ -54,12 +54,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "najm-abi"
+version = "0.1.0"
+
+[[package]]
 name = "najm-kernel"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "lazy_static",
  "linked_list_allocator",
+ "najm-abi",
  "pc-keyboard",
  "pic8259",
  "spin",

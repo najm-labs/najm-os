@@ -52,12 +52,15 @@ mod mm;
 mod realm;
 mod sched;
 mod security;
+mod selftest;
+mod syscall;
 
 use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::info::{FrameBuffer, PixelFormat};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use x86_64::VirtAddr;
 
 /// Requests that the bootloader map all physical memory into our virtual
@@ -73,10 +76,28 @@ use x86_64::VirtAddr;
 /// the bootloader wouldn't map it into memory at all, leaving
 /// `boot_info.ramdisk_addr` `None` regardless of whether a ramdisk was
 /// actually attached to the disk image.
+/// Also constrains **every** dynamic mapping the bootloader makes - the
+/// kernel image, its stack, the boot info, the framebuffer, the
+/// physical-memory window and the ramdisk - to start at
+/// `layout::HIGHER_HALF_START` rather than at the default of 0.
+///
+/// This is the single line that makes per-process address spaces
+/// possible. With dynamic mappings allowed anywhere, the bootloader
+/// places kernel structures in the lower half, which is precisely the
+/// region each user process needs to own privately; a per-process page
+/// table would then have to either share those entries (leaking kernel
+/// mappings into every process and making one process's changes visible
+/// to all) or drop them on CR3 switch (immediately fatal, since the very
+/// next instruction fetch is from unmapped memory). Pinning everything
+/// kernel-side above the split means creating an address space is
+/// "copy PML4 entries 256..512" and nothing else. See `mm::layout` for
+/// the whole map, and `memory::pml4_entries_in_use` for the boot-time
+/// check that the bootloader actually honoured this.
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
     config.mappings.ramdisk_memory = Mapping::Dynamic;
+    config.mappings.dynamic_range_start = Some(mm::layout::HIGHER_HALF_START);
     config
 };
 
@@ -97,7 +118,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // (see interrupts.rs) prints a line and execution resumes normally
     // right here, immediately after.
     x86_64::instructions::interrupts::int3();
-    serial_println!("Najm Kernel: resumed after breakpoint exception (IDT confirmed working)");
+    selftest::check(
+        "IDT",
+        true,
+        format_args!("resumed normally after a deliberate breakpoint exception"),
+    );
 
     // Another live self-test, same philosophy: `interrupts::init()` just
     // enabled hardware interrupts (PIC remapped, `sti` executed), but
@@ -110,11 +135,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     while arch::x86_64::interrupts::timer_ticks() < starting_ticks + 3 {
         x86_64::instructions::hlt();
     }
-    serial_println!(
-        "Najm Kernel: timer interrupt confirmed working ({} ticks observed)",
-        arch::x86_64::interrupts::timer_ticks()
+    selftest::check(
+        "timer IRQ",
+        arch::x86_64::interrupts::timer_ticks() > starting_ticks,
+        format_args!(
+            "tick counter advanced from {} to {}",
+            starting_ticks,
+            arch::x86_64::interrupts::timer_ticks()
+        ),
     );
-    serial_println!("Najm Kernel: keyboard interrupt handler installed - click the QEMU window and type to test");
 
     let physical_memory_offset = VirtAddr::new(
         boot_info
@@ -130,6 +159,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // `physical_memory_offset` is exactly the value the bootloader just
     // reported above - not guessed, computed, or reused.
     let mut mapper = unsafe { mm::memory::init(physical_memory_offset) };
+
+    serial_println!(
+        "Najm Kernel: physical memory mapped at {:#x} (higher half starts at {:#x})",
+        physical_memory_offset.as_u64(),
+        mm::layout::HIGHER_HALF_START
+    );
     // Safety: `boot_info.memory_regions` comes directly from the
     // bootloader's own memory probing during boot - trusted here for the
     // same reason the rest of BootInfo already is.
@@ -139,8 +174,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     mm::allocator::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
     serial_println!(
-        "Najm Kernel: heap mapped and initialized ({} KiB)",
-        mm::allocator::HEAP_SIZE / 1024
+        "Najm Kernel: heap mapped and initialized ({} KiB at {:#x})",
+        mm::allocator::HEAP_SIZE / 1024,
+        mm::allocator::HEAP_START
     );
 
     // Another live self-test, same philosophy as the breakpoint one
@@ -149,8 +185,50 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // the global allocator and would panic immediately if it were
     // misconfigured, and print the result to prove it end-to-end.
     let heap_test: Vec<u32> = (0..10).map(|i| i * i).collect();
-    serial_println!("Najm Kernel: heap allocation test: {:?}", heap_test);
+    selftest::check(
+        "kernel heap",
+        heap_test == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81],
+        format_args!("allocated and read back {:?}", heap_test),
+    );
     drop(heap_test);
+
+    // Drop the identity mapping the bootloader left in the lower half,
+    // then verify the address-space split `mm::layout` describes actually
+    // holds. Both matter, and for different reasons: the first removes
+    // bootloader code that would otherwise be mapped into every future
+    // process at a low address, and the second checks that
+    // `BOOTLOADER_CONFIG`'s `dynamic_range_start` request was honoured
+    // rather than trusting it. If a kernel mapping had landed in the
+    // lower half, per-process address spaces would silently share a
+    // top-level page table entry with the kernel - a security boundary
+    // that stops existing without anything crashing.
+    //
+    // Safety: nothing is executing from or holding a pointer into the
+    // lower half at this point. The kernel image, its stack, the boot
+    // info, the framebuffer, the ramdisk and the heap are all in the
+    // higher half (verified by the check immediately below), and no user
+    // process exists yet.
+    let cleared = unsafe { mm::memory::clear_lower_half_mappings() };
+    if !cleared.is_empty() {
+        serial_println!(
+            "Najm Kernel: dropped {} leftover lower-half PML4 entries {:?} (the bootloader's \
+             identity-mapped context-switch stub - dead code that would otherwise be mapped \
+             into every user process)",
+            cleared.len(),
+            cleared
+        );
+    }
+
+    let (lower_half_entries, higher_half_entries) = mm::memory::pml4_entries_in_use();
+    selftest::check(
+        "address space split",
+        lower_half_entries == 0 && higher_half_entries > 0,
+        format_args!(
+            "{} lower-half PML4 entries in use (must be 0 - the lower half belongs to user \
+             processes), {} higher-half entries (the kernel)",
+            lower_half_entries, higher_half_entries
+        ),
+    );
 
     // First live test of the capability system: issue a token, use it
     // successfully, revoke it, then prove the *same identity* (a derived
@@ -171,18 +249,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         cap.revoke();
 
-        match drivers::serial::write_with_capability(
+        let blocked = drivers::serial::write_with_capability(
             &cap_copy,
             format_args!("Najm Kernel: BUG - this write should have been blocked\n"),
-        ) {
-            Ok(()) => serial_println!(
-                "Najm Kernel: CAPABILITY SYSTEM FAILURE - a revoked capability's derived copy still worked"
+        );
+        selftest::check(
+            "capability revocation (SerialWrite)",
+            blocked.is_err(),
+            format_args!(
+                "a derived copy of a revoked capability was {}",
+                match &blocked {
+                    Ok(()) => "still accepted - revocation does not propagate to derived copies",
+                    Err(err) => {
+                        let _ = err;
+                        "correctly refused"
+                    }
+                }
             ),
-            Err(err) => serial_println!(
-                "Najm Kernel: capability system confirmed working - derived copy correctly blocked ({})",
-                err
-            ),
-        }
+        );
 
         // Same proof, second right: TimerRead is a completely different
         // capability type from SerialWrite, gating a different piece of
@@ -192,26 +276,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         let timer_cap = Capability::<TimerRead>::issue();
         let timer_cap_copy = timer_cap.derive();
-        match arch::x86_64::interrupts::ticks_with_capability(&timer_cap) {
-            Ok(ticks) => serial_println!(
-                "Najm Kernel: TimerRead capability confirmed working - {} ticks observed",
-                ticks
+        let before_revoke = arch::x86_64::interrupts::ticks_with_capability(&timer_cap);
+        selftest::check(
+            "capability grant (TimerRead)",
+            before_revoke.is_ok(),
+            format_args!(
+                "a freshly issued token read the tick counter: {:?}",
+                before_revoke.as_ref().ok()
             ),
-            Err(err) => serial_println!(
-                "Najm Kernel: CAPABILITY SYSTEM FAILURE - freshly issued TimerRead capability was rejected ({})",
-                err
-            ),
-        }
+        );
+
         timer_cap.revoke();
-        match arch::x86_64::interrupts::ticks_with_capability(&timer_cap_copy) {
-            Ok(_) => serial_println!(
-                "Najm Kernel: CAPABILITY SYSTEM FAILURE - a revoked TimerRead capability still worked"
+        let after_revoke = arch::x86_64::interrupts::ticks_with_capability(&timer_cap_copy);
+        selftest::check(
+            "capability revocation (TimerRead)",
+            after_revoke.is_err(),
+            format_args!(
+                "reading through a revoked token {}",
+                if after_revoke.is_ok() {
+                    "still succeeded"
+                } else {
+                    "was correctly refused"
+                }
             ),
-            Err(err) => serial_println!(
-                "Najm Kernel: TimerRead revocation confirmed working - read correctly blocked ({})",
-                err
-            ),
-        }
+        );
     }
 
     match boot_info.framebuffer.as_mut() {
@@ -345,21 +433,81 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         x86_64::instructions::hlt();
     }
     let post_exit_check: Vec<u32> = (0..5).map(|i| i + 100).collect();
-    serial_println!(
-        "Najm Kernel: post-program health check - timer still ticking ({} ticks), heap still \
-         working ({:?})",
-        arch::x86_64::interrupts::timer_ticks(),
-        post_exit_check
+    selftest::check(
+        "kernel alive after Ring 3",
+        arch::x86_64::interrupts::timer_ticks() >= ticks_before + 3
+            && post_exit_check == [100, 101, 102, 103, 104],
+        format_args!(
+            "timer still ticking ({}) and heap still working ({:?}) after two user programs \
+             ran and died",
+            arch::x86_64::interrupts::timer_ticks(),
+            post_exit_check
+        ),
     );
 
-    // The final handoff, and the one ending `kernel_main` still has:
-    // `start()` never returns, because the cooperative scheduler has no
-    // "every task finished, resume the boot context" path. Everything
-    // above this line therefore runs on every boot with nothing commented
-    // out - the self-tests, both Ring 3 programs, and the health check -
-    // and the scheduler gets the machine afterwards.
+    // Hand the CPU to the scheduler and take it back once every task has
+    // finished. This used to be `sched::task::start()`, which never
+    // returned - so nothing could run after the tasks, and the boot had
+    // no ending to report. See `run_until_idle` for why that changed.
     serial_println!("Najm Kernel: handing the CPU to the scheduler");
-    sched::task::start();
+    sched::task::run_until_idle();
+    selftest::check(
+        "preemption",
+        PREEMPTIONS_OBSERVED.load(Ordering::SeqCst) > 0,
+        format_args!(
+            "{} task iterations ran while a task that never calls yield_now() held the CPU",
+            PREEMPTIONS_OBSERVED.load(Ordering::SeqCst)
+        ),
+    );
+    selftest::check(
+        "scheduler drained",
+        sched::task::task_count() == 0,
+        format_args!(
+            "every spawned task ran to completion and exited; {} remain queued",
+            sched::task::task_count()
+        ),
+    );
+
+    epilogue()
+}
+
+/// The end of a boot: report the verdict, then stop.
+///
+/// Split out of `kernel_main` because it is the one part that behaves
+/// differently on real hardware than under the emulator, and that
+/// difference should be readable in one place rather than inferred. Under
+/// QEMU with `-device isa-debug-exit` the machine terminates with an exit
+/// code `scripts/boot-test.sh` interprets. Anywhere else the port write
+/// does nothing and control falls through to `halt_loop`, which is the
+/// correct behaviour for a physical machine: finishing a self-test is not
+/// a reason to power off.
+fn epilogue() -> ! {
+    serial_println!(
+        "Najm Kernel: {} syscalls dispatched, {} timer ticks ({} ms of uptime)",
+        syscall::count(),
+        arch::x86_64::interrupts::timer_ticks(),
+        arch::x86_64::interrupts::uptime_ms()
+    );
+
+    let (heap_used, heap_free) = mm::allocator::heap_stats();
+    serial_println!(
+        "Najm Kernel: heap at end of boot - {} KiB used, {} KiB free",
+        heap_used / 1024,
+        heap_free / 1024
+    );
+
+    let all_passed = selftest::report();
+
+    drivers::qemu::exit(if all_passed {
+        drivers::qemu::ExitCode::Success
+    } else {
+        drivers::qemu::ExitCode::Failed
+    });
+
+    serial_println!(
+        "Najm Kernel: no debug-exit device responded (this is real hardware, not QEMU) - halting"
+    );
+    halt_loop()
 }
 
 /// Reports how a Ring 3 program ended, and checks it against the outcome
@@ -392,21 +540,49 @@ fn report_program_exit(
         exit
     );
 
-    if exit == expected {
-        serial_println!(
-            "Najm Kernel: {} - correct outcome ({:?} is what this payload exists to prove)",
-            what,
-            expected
-        );
-    } else {
-        serial_println!(
-            "Najm Kernel: RING 3 TEST FAILURE - the {} ended with {:?}, but should have \
-             ended with {:?}",
-            what,
-            exit,
-            expected
-        );
+    selftest::check(
+        what,
+        exit == expected,
+        format_args!(
+            "ended with {:?} ({:?} is the outcome this payload exists to prove)",
+            exit, expected
+        ),
+    );
+}
+
+/// Set while `task_spinner` is inside its non-yielding busy loop.
+///
+/// This is what turns the preemption test from something a human reads
+/// off a log into something the kernel checks itself. Before, the
+/// evidence for preemption was "do `[Task A]` lines appear between the
+/// spinner's two messages?" - a real proof, but one that only exists in
+/// the eye of whoever is reading. Now A, B and C each look at this flag
+/// when they run: if it is set, the only way they could be executing is
+/// that something took the CPU away from a task that never offered it.
+static SPINNER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// How many times a task observed itself running while `SPINNER_ACTIVE`
+/// was set. Any value above zero is preemption; zero means the scheduler
+/// silently degraded to cooperative-only.
+static PREEMPTIONS_OBSERVED: AtomicU32 = AtomicU32::new(0);
+
+/// Records that this task is running, and whether it did so while the
+/// spinner held the CPU.
+fn note_scheduled(who: &str, iteration: u32) {
+    let preempted_the_spinner = SPINNER_ACTIVE.load(Ordering::SeqCst);
+    if preempted_the_spinner {
+        PREEMPTIONS_OBSERVED.fetch_add(1, Ordering::SeqCst);
     }
+    serial_println!(
+        "[{}] iteration {}{}",
+        who,
+        iteration,
+        if preempted_the_spinner {
+            " (running while the spinner never yielded - this line is preemption)"
+        } else {
+            ""
+        }
+    );
 }
 
 /// One of three test tasks proving the scheduler actually switches
@@ -415,15 +591,15 @@ fn report_program_exit(
 /// picture.
 extern "C" fn task_a() -> ! {
     for i in 0..3 {
-        serial_println!("[Task A] iteration {}", i);
+        note_scheduled("Task A", i);
         sched::task::yield_now();
     }
-    // No further yields after this: with no task-removal mechanism yet
-    // (a documented, deliberate limitation - see task.rs), the only way
-    // for a finished task to stop consuming CPU time is to park itself
-    // here permanently rather than yield into a slot nothing will ever
-    // resume it from.
-    halt_loop();
+    // `exit_task`, not `halt_loop`. A parked task stays in the ready
+    // queue forever, gets scheduled, and burns a slice doing nothing -
+    // and, more importantly, means the scheduler can never observe that
+    // everything finished, which is what `run_until_idle` needs in order
+    // to hand control back for the boot summary.
+    sched::task::exit_task();
 }
 
 /// See `task_a` - identical in every respect except which letter it
@@ -431,10 +607,10 @@ extern "C" fn task_a() -> ! {
 /// variable being demonstrated.
 extern "C" fn task_b() -> ! {
     for i in 0..3 {
-        serial_println!("[Task B] iteration {}", i);
+        note_scheduled("Task B", i);
         sched::task::yield_now();
     }
-    halt_loop();
+    sched::task::exit_task();
 }
 
 /// See `task_a` and `task_b` - a third, identically-structured task
@@ -443,10 +619,10 @@ extern "C" fn task_b() -> ! {
 /// `kernel_main`).
 extern "C" fn task_c() -> ! {
     for i in 0..3 {
-        serial_println!("[Task C] iteration {}", i);
+        note_scheduled("Task C", i);
         sched::task::yield_now();
     }
-    halt_loop();
+    sched::task::exit_task();
 }
 
 /// How many timer ticks `task_spinner` refuses to give up the CPU for.
@@ -478,15 +654,17 @@ extern "C" fn task_spinner() -> ! {
         SPIN_TICKS
     );
 
+    SPINNER_ACTIVE.store(true, Ordering::SeqCst);
     while arch::x86_64::interrupts::timer_ticks() < started_at + SPIN_TICKS {
         core::hint::spin_loop();
     }
+    SPINNER_ACTIVE.store(false, Ordering::SeqCst);
 
     serial_println!(
         "[Spinner] busy loop finished after {} ticks",
         arch::x86_64::interrupts::timer_ticks() - started_at
     );
-    halt_loop();
+    sched::task::exit_task();
 }
 
 /// Fills the boot framebuffer with a solid, deliberately-chosen color,

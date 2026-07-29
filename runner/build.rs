@@ -128,15 +128,19 @@ fn build_syscall_test_elf() -> Vec<u8> {
     // here because this payload has no way to `use` them - the real fix
     // for that duplication is a userland crate that shares constants,
     // which is the next milestone.
-    const SYS_EXIT: u32 = 0;
-    const SYS_WRITE: u32 = 1;
+    const SYS_EXIT: u32 = najm_abi::sys::EXIT as u32;
+    const SYS_WRITE: u32 = najm_abi::sys::WRITE as u32;
+    // `write` takes a file descriptor as its first argument now, so this
+    // payload has to pass one where it previously passed the buffer
+    // pointer directly.
+    const STDOUT: u32 = najm_abi::fd::STDOUT as u32;
 
     // A kernel address, chosen to be one this program has no business
-    // reading: `allocator::HEAP_START`. It is mapped and present, so the
-    // only thing that can reject it is the USER_ACCESSIBLE check - which
-    // is precisely the property being tested. A merely-unmapped address
-    // would be refused for the wrong reason and prove nothing.
-    const KERNEL_HEAP_ADDR: u64 = 0x_4444_4444_0000;
+    // reading: the base of the kernel heap. It is mapped and present, so
+    // the only thing that can reject it is the user/supervisor check -
+    // which is precisely the property being tested. A merely-unmapped
+    // address would be refused for the wrong reason and prove nothing.
+    const KERNEL_HEAP_ADDR: u64 = najm_abi::layout::KERNEL_PROBE_ADDRESS;
 
     let mut payload = Vec::new();
 
@@ -148,19 +152,27 @@ fn build_syscall_test_elf() -> Vec<u8> {
     payload.extend_from_slice(&[0xC6, 0x40, 0x01, b'K']); // MOV byte [rax+1], 'K'
     payload.extend_from_slice(&[0xC6, 0x40, 0x02, b'\n']); // MOV byte [rax+2], '\n'
 
-    // --- write(ptr = bss_target, len = 3) ---
-    payload.extend_from_slice(&[0x48, 0x89, 0xC7]); // MOV rdi, rax    (arg1 = ptr)
-    payload.extend_from_slice(&[0x48, 0xC7, 0xC6]); // MOV rsi, imm32  (arg2 = len)
+    // --- write(fd = STDOUT, ptr = bss_target, len = 3) ---
+    // Argument registers are RDI, RSI, RDX in that order. `write` gained
+    // a leading file-descriptor argument when the syscall ABI moved into
+    // the shared `najm-abi` crate, so the buffer pointer now goes in RSI
+    // rather than RDI.
+    payload.extend_from_slice(&[0x48, 0x89, 0xC6]); // MOV rsi, rax    (arg2 = ptr)
+    payload.extend_from_slice(&[0x48, 0xC7, 0xC7]); // MOV rdi, imm32  (arg1 = fd)
+    payload.extend_from_slice(&STDOUT.to_le_bytes());
+    payload.extend_from_slice(&[0x48, 0xC7, 0xC2]); // MOV rdx, imm32  (arg3 = len)
     payload.extend_from_slice(&3u32.to_le_bytes());
     payload.extend_from_slice(&[0x48, 0xC7, 0xC0]); // MOV rax, imm32  (syscall number)
     payload.extend_from_slice(&SYS_WRITE.to_le_bytes());
     payload.extend_from_slice(&[0xCD, 0x80]); // int 0x80
 
-    // --- write(ptr = kernel heap, len = 8) - must be REFUSED ---
+    // --- write(fd = STDOUT, ptr = kernel heap, len = 8) - must be REFUSED ---
     payload.push(0x48); // REX.W
-    payload.push(0xBF); // MOV rdi, imm64  (arg1 = a kernel pointer)
+    payload.push(0xBE); // MOV rsi, imm64  (arg2 = a kernel pointer)
     payload.extend_from_slice(&KERNEL_HEAP_ADDR.to_le_bytes());
-    payload.extend_from_slice(&[0x48, 0xC7, 0xC6]); // MOV rsi, imm32  (arg2 = len)
+    payload.extend_from_slice(&[0x48, 0xC7, 0xC7]); // MOV rdi, imm32  (arg1 = fd)
+    payload.extend_from_slice(&STDOUT.to_le_bytes());
+    payload.extend_from_slice(&[0x48, 0xC7, 0xC2]); // MOV rdx, imm32  (arg3 = len)
     payload.extend_from_slice(&8u32.to_le_bytes());
     payload.extend_from_slice(&[0x48, 0xC7, 0xC0]); // MOV rax, imm32
     payload.extend_from_slice(&SYS_WRITE.to_le_bytes());
@@ -180,7 +192,7 @@ fn build_syscall_test_elf() -> Vec<u8> {
 
     assert_eq!(
         payload.len(),
-        83,
+        97,
         "hand-encoded payload length drifted from the layout above"
     );
 
