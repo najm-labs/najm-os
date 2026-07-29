@@ -1,0 +1,30 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition = "2021"
+description = "Wraps the najm-kernel binary in a bootable disk image and launches it in QEMU"
+
+# This crate's build.rs does the actual image-creation work; the crate's
+# own main.rs just shells out to qemu-system-x86_64 with the right flags.
+# Kept as a completely separate (non-workspace) crate from kernel/ on
+# purpose: kernel/ targets bare-metal x86_64-unknown-none, this targets
+# your host platform, and giving them separate Cargo.lock files avoids any
+# dependency-resolution interaction between a freestanding target and a
+# hosted one.
+[dependencies]
+
+[build-dependencies]
+# Pinned to the EXACT version, not a floating "0.11". This crate's own
+# build.rs compiles a real BIOS/UEFI bootloader from source (via `cargo
+# install`), which depends on the `x86_64` crate for its own internals -
+# and that internal dependency has drifted before: `bootloader` 0.11.16
+# bumped it to `x86_64` 0.15.5, which requires Step trait methods
+# (`forward_overflowing`/`backward_overflowing`) that don't exist on the
+# nightly compiler pinned in ../rust-toolchain.toml, causing a hard build
+# failure (E0407) with no code change on our side at all - just a new
+# crate release resolving differently on the next `cargo build`. Pinning
+# the exact version here is what prevents that from happening silently
+# again. If you bump ../rust-toolchain.toml to a newer nightly, revisit
+# this pin (and kernel/Cargo.toml's matching `x86_64` and `bootloader_api`
+# pins) in the same commit - they all move together, never independently.
+bootloader = "=0.11.15"

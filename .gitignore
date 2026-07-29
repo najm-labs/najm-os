@@ -1,0 +1,12 @@
+# Cargo build output. Each of the three crates has its own target/ dir
+# (they are deliberately not one workspace - see runner/Cargo.toml).
+target/
+
+# Serial logs captured from QEMU runs. `-serial file:<path>` output is a
+# per-run artifact, never something to track.
+*.log
+serial-*.txt
+
+# Boot images produced by runner/build.rs land under runner/target/, which
+# the rule above already covers - this catches any that get copied out.
+*.img

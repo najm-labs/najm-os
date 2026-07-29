@@ -1,0 +1,31 @@
+[package]
+name = "najm-hello"
+version = "0.1.0"
+edition = "2021"
+description = "The first real userland program for Najm OS - a compiled, no_std Ring 3 binary"
+
+# A freestanding Ring 3 program, not a kernel and not a hosted binary.
+# It targets the same x86_64-unknown-none as the kernel deliberately:
+# that target is already installed via ../../rust-toolchain.toml, already
+# produces a static freestanding ELF, and needs no custom target JSON.
+# The only things that make this a *user* program rather than a second
+# kernel are the linker script (see build.rs and linker.ld) and the fact
+# that its only way to affect the world is `int 0x80`.
+[dependencies]
+
+# Nothing to unwind into here either - same reasoning as the kernel's own
+# profile settings. The target already implies `panic-strategy: abort`;
+# stating it is documentation, not a change.
+[profile.dev]
+panic = "abort"
+# This binary is embedded whole into the boot image as a ramdisk, so its
+# size is not just a build-artifact concern - the bootloader loads every
+# byte of it into memory before the kernel starts. With debug info the
+# ELF is ~770 KiB, of which under 10 KiB is the actual program; without,
+# it's a few KiB. Nothing can read DWARF on this system anyway: there's
+# no debugger, and the kernel's loader ignores every non-PT_LOAD section.
+debug = false
+
+[profile.release]
+panic = "abort"
+debug = false

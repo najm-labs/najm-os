@@ -1,0 +1,7 @@
+[build]
+# Makes `cargo build`/`cargo check` inside kernel/ work without needing
+# --target on the command line every time. The Makefile at the repo root
+# passes --target explicitly anyway, so this mainly matters if you cd into
+# kernel/ directly while iterating (e.g. `cargo check` for fast feedback
+# from rust-analyzer / the editor).
+target = "x86_64-unknown-none"

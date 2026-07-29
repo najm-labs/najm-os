@@ -1,0 +1,33 @@
+LICENSE — DECISION PENDING
+
+Najm OS is intended to be open source, but no license has been finalized yet.
+
+This matters more than it might seem for a project like this: if you intend to
+eventually build a commercial product or service on top of this kernel (e.g.
+paid support, a Vault Realm app store, hosted tooling), a permissive license
+like MIT or Apache-2.0 allows anyone — including a well-funded competitor —
+to take the code and ship a competing commercial product without contributing
+anything back.
+
+Options under consideration:
+
+- MIT / Apache-2.0 (dual) — maximally permissive, maximizes adoption and
+  contribution ease, but offers no protection against commercial forks.
+- GPL-3.0 — copyleft; derivative works must also be open source, but this
+  does not prevent SaaS-style commercial use without releasing modifications
+  (the "SaaS loophole").
+- AGPL-3.0 — closes the SaaS loophole (network use counts as distribution),
+  strongest protection for a project that might offer a hosted/commercial
+  offering later. Some contributors and companies are wary of AGPL, which
+  can slightly reduce contribution volume.
+- Dual-licensing (open source license + separate commercial license) — lets
+  the project owner sell commercial licenses to companies that don't want
+  AGPL/GPL obligations, while the community version stays fully open. Common
+  for projects with commercial ambitions, but adds legal/administrative
+  overhead and requires a Contributor License Agreement (CLA) to keep the
+  commercial licensing option clean.
+
+This file will be replaced with the actual license text once a decision is
+made. Until then, treat this repository as "all rights reserved" for any use
+beyond reading and evaluating the code — do not build production tooling on
+top of it under the assumption of a specific license.

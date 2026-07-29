@@ -1,0 +1,86 @@
+[package]
+name = "najm-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Najm Kernel - the freestanding kernel binary at the heart of Najm OS"
+
+# This crate produces a freestanding (#![no_std], #![no_main]) ELF binary.
+# It has no knowledge of how it gets booted; bootloader_api just gives it
+# a BootInfo struct describing memory and the framebuffer once control is
+# handed over. The `runner` crate (see ../runner) is what actually wraps
+# this binary in a bootable disk image and launches it under QEMU.
+[dependencies]
+# Pinned to the EXACT version, not a floating "0.11" - this crate's
+# internal build (see runner/Cargo.toml's own bootloader dependency)
+# pulls in the `x86_64` crate for its own BIOS/UEFI stage binaries, and
+# that internal dependency has drifted before (bootloader 0.11.16 moved
+# to x86_64 0.15.5, which needs a newer nightly than the one pinned in
+# ../rust-toolchain.toml - see the matching comment on the `x86_64`
+# dependency below for the full explanation). Pinning here means a new
+# bootloader_api release can't silently pull in that incompatibility
+# again the next time `cargo build` re-resolves dependencies.
+bootloader_api = "=0.11.15"
+
+# Serial (UART) output - the kernel's only way to report what's happening
+# until a proper text/logging subsystem exists. uart_16550 is the standard,
+# well-tested 16550 UART driver used throughout the rust-osdev ecosystem
+# rather than something worth hand-rolling at this stage.
+uart_16550 = "0.3"
+
+# `SERIAL1` (see src/serial.rs) needs to be a global, lazily-initialized,
+# lock-protected static - none of which `core` provides on its own in a
+# `#![no_std]` binary. `spin::Mutex` gives interior mutability without an
+# OS-provided lock, and `lazy_static` (with the `spin_no_std` feature, so
+# it doesn't pull in `std`) handles the one-time init on first access.
+spin = "0.9"
+lazy_static = { version = "1.5", features = ["spin_no_std"] }
+
+# Needed for `x86_64::instructions::interrupts::without_interrupts`, used
+# to make sure a serial write can't be interrupted mid-line. Also the
+# natural home for the CPU-level primitives (GDT, IDT, port I/O) the next
+# few milestones need.
+#
+# Pinned to the EXACT version 0.15.2, not a floating "0.15" - this is
+# directly coupled to the nightly pin in ../rust-toolchain.toml. Newer
+# x86_64 releases (0.15.3+) implement extra Step trait methods
+# (forward_overflowing/backward_overflowing) that only exist on nightly
+# compilers newer than our pin; on our pinned nightly, implementing
+# methods the Step trait doesn't declare yet is itself a compile error
+# (E0407) - the mirror image of the E0046 "missing methods" error that
+# happens on newer nightlies with the OLDER x86_64 0.15.2. In short:
+# x86_64 0.15.2 <-> old nightly, x86_64 0.15.5+ <-> new nightly - these
+# two pins must be bumped together, never independently. If you update
+# rust-toolchain.toml's channel, revisit this line in the same commit.
+x86_64 = "=0.15.2"
+
+# Backs the kernel heap (see src/allocator.rs) so `alloc` types - `Box`,
+# `Vec`, `String` - actually work. A simple, well-tested no_std linked-list
+# allocator rather than something hand-rolled at this stage; the interesting
+# kernel-specific work is in how the heap's virtual memory gets mapped
+# (allocator.rs), not in the allocator algorithm itself.
+linked_list_allocator = "0.10"
+
+# Legacy 8259 Programmable Interrupt Controller support (src/interrupts.rs).
+# This, not the modern APIC, is the deliberate choice for now: APIC setup
+# requires parsing ACPI tables (the MADT) to discover LAPIC/IOAPIC
+# addresses, which this kernel doesn't do yet, and only actually matters
+# once multiple CPU cores are in play - which nothing here uses yet either.
+# The PIC is universally supported, needs no table parsing, and is the
+# correct tool for a single-core kernel at this stage. Revisit this when
+# SMP support becomes an actual milestone, not before.
+pic8259 = "0.11"
+
+# PS/2 keyboard scancode decoding (src/interrupts.rs) - translates raw
+# scancodes into `KeyCode`/`DecodedKey` values instead of hand-rolling a
+# scancode-set-1 state machine, which is exactly the kind of fiddly,
+# well-solved problem not worth re-solving from scratch here.
+pc-keyboard = "0.9"
+
+# A kernel panicking must never unwind (there's no runtime to unwind into)
+# so panic=abort is set explicitly rather than relied upon implicitly.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true

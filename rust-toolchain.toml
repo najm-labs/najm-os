@@ -1,0 +1,19 @@
+[toolchain]
+# Pinned to a specific date rather than floating "nightly", because the
+# `bootloader` crate (0.11.15, the newest release as of this writing)
+# internally depends on `x86_64 0.15.2`, which does not implement the
+# `Step::forward_overflowing`/`backward_overflowing` methods that a very
+# recent (July 2026) nightly compiler now requires. `x86_64 0.15.5` fixes
+# this on the crate side, but `bootloader` hasn't cut a release against it
+# yet - so for now, the fix is a compiler-side pin, not a dependency bump.
+#
+# If you hit `error[E0046]: not all trait items implemented, missing:
+# forward_overflowing, backward_overflowing` pointing at the `x86_64`
+# crate, that means your nightly is newer than this pin somehow (or you're
+# not picking up rust-toolchain.toml - run `rustup show` from the repo
+# root to check). Once rust-osdev/bootloader ships a release depending on
+# x86_64 >= 0.15.5, this pin can be safely removed in favor of a floating
+# "nightly" channel again.
+channel = "nightly-2026-06-01"
+components = ["rust-src", "llvm-tools-preview"]
+targets = ["x86_64-unknown-none"]
