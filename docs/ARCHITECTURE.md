@@ -124,6 +124,8 @@ Kernel-level integrity attestation for Gaming Realm is a **prerequisite for**, n
 
 ## 6. Driver Strategy
 
+PCI enumeration exists (`kernel/src/drivers/pci.rs`) - the first bus this kernel discovers rather than assumes, and the prerequisite for everything below. Also implemented: the CMOS real-time clock, a PS/2 keyboard and mouse feeding an event queue, and the PIT reprogrammed to a known 100 Hz.
+
 Writing a full driver stack from scratch is not realistic for this project's timeline. Planned approach, in order of investigation priority:
 
 1. A compatibility shim for a constrained subset of Linux driver interfaces, where license and design permit.
@@ -134,7 +136,8 @@ This is explicitly the highest-risk part of the project and where outside contri
 
 ## 7. Open Questions
 
-- Exact IPC mechanism and its performance characteristics under Gaming Realm latency constraints.
+- Exact IPC mechanism and its performance characteristics under Gaming Realm latency constraints. The syscall numbers are reserved (`abi/src/lib.rs`) and nothing implements them yet, which is why every service that should be a separate process is currently inside the kernel.
+- **Persistence.** The filesystem is read-only and lives in the boot image. This blocks the Store, the app SDK and ordinary use equally, and is the single most useful thing to build next.
 - Whether filesystem logic lives in the privileged core or as an isolated service (trade-off between crash-resilience and I/O latency).
 - GPU passthrough mechanism for Gaming Realm without a full virtualization layer.
 - Timing/resource-contention side-channels between Realms sharing the same physical GPU during concurrent rendering (see section 2d, threat #7) — capability isolation in software doesn't fully close this, and it isn't solved by this design yet.

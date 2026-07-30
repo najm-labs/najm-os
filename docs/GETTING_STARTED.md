@@ -328,22 +328,111 @@ smallest possible working slice. The next milestones, in order (see
     again. A Ring 3 program still cannot be preempted - see
     ARCHITECTURE.md section 4 for why, and what it needs.
 
+15. ~~A higher-half kernel and the address-space split.~~ Done - see
+    `abi/src/layout.rs`. Every kernel mapping moved above
+    `0xffff_8000_0000_0000`, so the entire lower half belongs to user
+    processes. This was the prerequisite for everything below it. Also
+    introduced `abi/` (the shared kernel/userland contract, replacing
+    three copies of the syscall numbers) and `scripts/boot-test.sh`,
+    which makes `make test` a real pass/fail rather than something a
+    human reads.
+16. ~~NX, W^X, SMEP/SMAP/UMIP, and guard pages.~~ Done - see
+    `kernel/src/arch/x86_64/cpu.rs`. The ELF loader derives page
+    permissions from `p_flags` and refuses any segment asking for write
+    and execute together; kernel stacks moved into `mm::kstack`, where
+    each has an unmapped page beneath it. Proven by `run_nx_test`, which
+    jumps into a `NO_EXECUTE` page from Ring 3 and requires a fault.
+17. ~~Per-process address spaces.~~ Done - see
+    `kernel/src/mm/address_space.rs`. Each process gets a PML4 whose
+    higher half is copied from the kernel's and whose lower half is its
+    own. Closes three separately-documented gaps at once: Realm memory
+    isolation, ownership (not merely privilege) on syscall pointers, and
+    reclaiming a terminated program's memory.
+18. ~~Processes, and Ring 3 preemption.~~ Done - see
+    `kernel/src/process.rs`. A process is an address space plus a kernel
+    stack plus a scheduler task, and being a task is what makes it
+    preemptible. ARCHITECTURE.md section 4's recorded limitation - that a
+    Ring 3 program could not be preempted - no longer holds.
+19. ~~A filesystem.~~ Done - see `kernel/src/fs.rs` and
+    `abi/src/archive.rs`. The ramdisk is a NAR archive rather than one
+    bare binary, served zero-copy, with `open`/`read`/`close`/`seek`/
+    `stat`/`readdir` syscalls. Paths containing `..` are rejected rather
+    than normalized.
+20. ~~Realm scheduling classes.~~ Done - see `kernel/src/sched/class.rs`.
+    Three classes, each with a quantum as well as a priority, plus
+    rate-limited anti-starvation promotion. The realtime latency is
+    *measured* on every boot and asserted against a budget.
+21. ~~Device drivers.~~ Done - PCI enumeration, the CMOS real-time clock,
+    and an input event queue with a PS/2 mouse. See `kernel/src/drivers/`.
+22. ~~The compositor and the trusted path.~~ Done - see
+    `kernel/src/graphics/`. Implements ARCHITECTURE.md 2c and 2d,
+    including the reserved strip no Realm can address in any mode, the
+    per-boot signature drawn from Core state, and a theme system that can
+    change the trust bar's colours and nothing else.
+23. ~~Mirage: running a Windows binary.~~ Done - see
+    `kernel/src/mirage/`. A PE32+ image is relocated, has its imports
+    bound to ABI-translation thunks, and runs at Ring 3. Four Win32
+    functions, against Wine's tens of thousands - see that module's docs
+    for exactly where the line is.
+24. ~~Najm Store package verification.~~ Done - see `kernel/src/store.rs`
+    and `docs/APP_SDK.md`. SHA-256 integrity checking against FIPS
+    180-4's own vectors, and ARCHITECTURE.md 2e's Realm assignment
+    policy: elevation is a credential, not a declaration, and the
+    unimplemented signature verifier fails *closed*.
+
 ### What one boot now proves
 
-`kernel_main` used to have several endings commented out, because only
-one `-> !` call could be "the last thing that happens" per boot and
-checking a different one meant editing the source. Now every self-test
-above runs in sequence on every boot, unedited: the breakpoint and timer
-checks, the heap, both capability demonstrations, the hand-written Ring 3
-payload, the compiled userland program, a post-program health check that
-the kernel is still genuinely alive, and finally the scheduler - which is
-also the first time the three Realm-profile tasks actually *execute*
-rather than merely being spawned.
+`make test` boots the system headless, runs **33 self-tests**, and exits
+with a verdict. Every one of them is a live check against real hardware
+behaviour rather than a claim in a comment:
 
-Next up: a minimal filesystem (so programs can be loaded from something
-richer than a single build-time ramdisk), separate address spaces per
-Realm (which is simultaneously what allows reclaiming a terminated
-program's memory, preempting Ring 3 code, and enforcing ownership rather
-than mere privilege on syscall pointers), per-segment page permissions
-and W^X in the ELF loader, and the Realm Assignment verification
-ARCHITECTURE.md section 2e describes.
+- The address-space split holds, and the bootloader's leftover identity
+  mapping is gone.
+- NX, SMEP, SMAP and UMIP are active, and NX is *proven* by a Ring 3 jump
+  into a non-executable page faulting.
+- A kernel stack's guard page is genuinely unmapped, checked by walking
+  the page tables.
+- Two processes run from the same image at the same virtual address in
+  separate address spaces - impossible before per-process page tables -
+  and their memory comes back when they exit.
+- The timer preempts a program running at Ring 3, counted rather than
+  inferred from output ordering.
+- A realtime task's worst wait is measured twice independently and
+  checked against a budget, while background tasks are shown to be
+  deprioritized without being frozen.
+- A second, different binary loaded *by path* exercises the filesystem,
+  and every refusal - a missing file, a `..` in a path, a write to a
+  read-only filesystem, a directory read as a file - is checked for the
+  specific error it should produce.
+- The compositor's reserved strip is unreachable by any surface, and the
+  trust signature is verified by reading pixels back *out* of the
+  framebuffer.
+- A Windows PE binary runs and exits with a status that only survives if
+  relocation, import binding and calling-convention translation all
+  worked.
+- A tampered package is rejected, and every package requesting the Vault
+  Realm is placed in Home.
+
+Any line containing `FAILURE`, `MISALIGNED`, `PANIC` or `BAD:` is a real
+problem. That vocabulary is reserved - code that *correctly rejects*
+something must not use it, or a passing test reads as a broken kernel.
+
+### What comes next
+
+The gaps that block the most, in the order they block it:
+
+1. **Persistence.** The filesystem is read-only and lives in the boot
+   image. Nothing any program writes survives a reboot, because there is
+   nowhere to write it. This needs a disk driver (AHCI) and a writable
+   filesystem, and it blocks the Store, the app SDK and ordinary use
+   equally.
+2. **IPC.** The syscall numbers are reserved (`abi/src/lib.rs`) and
+   nothing implements them. Every service that should be a separate
+   process is currently in the kernel because there is no other way for
+   it to be reached.
+3. **Ed25519**, without which no package can ever be elevated to Vault.
+4. **Mirage's API surface.** Four functions. See `docs/APP_SDK.md` for
+   why this is both the highest-value and the longest-running item.
+5. **SMP.** Everything here is single-core, and several locks are correct
+   only because of it - `mm::allocator`'s interrupts-off critical section
+   in particular buys nothing against a second core.

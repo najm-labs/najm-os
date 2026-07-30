@@ -4,7 +4,34 @@
 
 Najm OS is designed from the ground up to solve a problem no mainstream OS solves well: running latency-critical gaming workloads, security-critical paid software, and general-purpose user applications on the *same machine* without any of them compromising the others' performance, security, or integrity guarantees.
 
-> **Status:** Early development. The kernel boots in QEMU, manages memory, handles hardware interrupts, runs a **preemptive** task scheduler, has a working capability token primitive connected to a first Realm prototype, and runs **real compiled userland programs at Ring 3**: a `no_std` Rust program is built from source, attached to the boot image as a ramdisk, parsed by the kernel's ELF64 loader, mapped, executed at Ring 3, makes syscalls (`write`, `exit`) through a hand-written `int 0x80` entry stub, and exits cleanly back to the kernel — which keeps running. A faulting program is now terminated on its own rather than halting the machine. Still no filesystem, no dynamic linking, no per-program address spaces (so a terminated program's memory is not reclaimed), and no full Realm isolation. See [ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the technical design, [GETTING_STARTED.md](./docs/GETTING_STARTED.md) to build and run it, and [CONTRIBUTING.md](./CONTRIBUTING.md) to get involved.
+> **Status:** Early development, and further along than that phrase
+> usually implies. The kernel boots in QEMU with **33 self-tests passing
+> on every boot** (`make test`), and each of them checks real hardware
+> behaviour rather than a claim in a comment.
+>
+> Working today: a higher-half kernel with **per-process address spaces**;
+> **NX, W^X, SMEP, SMAP and UMIP** enforced, with NX proven by a Ring 3
+> jump into a non-executable page faulting; **preemptive scheduling with
+> Realm classes** whose worst-case latency is measured and asserted;
+> **Ring 3 preemption**; a **read-only filesystem** with real file
+> syscalls; **PCI enumeration**, a real-time clock, keyboard and mouse; a
+> **compositor with the non-spoofable trusted path** ARCHITECTURE.md
+> section 2d specifies; **Mirage**, which runs a Windows PE binary
+> natively; and **Najm Store** package verification implementing
+> ARCHITECTURE.md 2e's rule that Realm elevation is a credential rather
+> than a declaration.
+>
+> Not working, listed because a status section that only lists successes
+> is marketing: **nothing persists** (the filesystem is read-only and
+> lives in the boot image), there is **no IPC**, **no SMP**, Mirage
+> implements **four Win32 functions** against Wine's tens of thousands,
+> and package signature verification is **unimplemented and fails
+> closed** - so no package can currently be elevated to Vault.
+>
+> See [ARCHITECTURE.md](./docs/ARCHITECTURE.md) for the design,
+> [GETTING_STARTED.md](./docs/GETTING_STARTED.md) to build and run it,
+> [APP_SDK.md](./docs/APP_SDK.md) for how applications are meant to be
+> built, and [CONTRIBUTING.md](./CONTRIBUTING.md) to get involved.
 
 ---
 
