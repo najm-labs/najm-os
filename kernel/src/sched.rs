@@ -3,4 +3,5 @@
 //! scheduling classes ARCHITECTURE.md section 4 describes, as siblings
 //! here rather than as a rewrite of `task` itself.
 
+pub mod class;
 pub mod task;

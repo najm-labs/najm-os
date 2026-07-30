@@ -62,7 +62,7 @@ use bootloader_api::config::{BootloaderConfig, Mapping};
 use bootloader_api::info::{FrameBuffer, PixelFormat};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::VirtAddr;
 
 /// Requests that the bootloader map all physical memory into our virtual
@@ -593,8 +593,67 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // finished. This used to be `sched::task::start()`, which never
     // returned - so nothing could run after the tasks, and the boot had
     // no ending to report. See `run_until_idle` for why that changed.
+    // The scheduling-class test: one realtime task that measures its own
+    // worst-case wait, against three background tasks that never yield.
+    // Spawned last so they queue behind everything else, which is also
+    // the least favourable starting position for the realtime task - if
+    // its latency bound holds from the back of a full queue, it holds.
+    sched::task::spawn_in_class(task_latency_probe, sched::class::SchedClass::Realtime);
+    for _ in 0..3 {
+        sched::task::spawn_in_class(task_background_hog, sched::class::SchedClass::Background);
+    }
+
     serial_println!("Najm Kernel: handing the CPU to the scheduler");
     sched::task::run_until_idle();
+
+    // Two independent measurements of the same property, which is the
+    // point: the probe timed itself, and the scheduler recorded what it
+    // dispatched. Either alone could be wrong in a way that flattered the
+    // result; agreeing is evidence.
+    let realtime_gap = REALTIME_MAX_GAP.load(Ordering::SeqCst);
+    let realtime_gap_ms = realtime_gap * 1000 / arch::x86_64::interrupts::TIMER_HZ;
+    selftest::check(
+        "realtime latency budget",
+        realtime_gap <= sched::class::REALTIME_LATENCY_BUDGET_TICKS,
+        format_args!(
+            "the realtime task's worst wait between turns was {} tick(s) ({} ms) against a budget \
+             of {} ({} ms), while three background tasks spun without yielding and a Gaming Realm \
+             process shared the realtime class",
+            realtime_gap,
+            realtime_gap_ms,
+            sched::class::REALTIME_LATENCY_BUDGET_TICKS,
+            sched::class::REALTIME_LATENCY_BUDGET_TICKS * 1000
+                / arch::x86_64::interrupts::TIMER_HZ
+        ),
+    );
+
+    let stats = sched::task::class_stats();
+    for (class, stat) in stats {
+        serial_println!(
+            "Najm Kernel: scheduler class {:>10} - {} dispatches, worst wait {} tick(s), {} \
+             anti-starvation promotions",
+            class.name(),
+            stat.dispatches,
+            stat.max_wait_ticks,
+            stat.promotions
+        );
+    }
+
+    // The other half of the policy, and the one that is easy to leave
+    // untested: strict priority alone lets a busy Realtime Realm freeze
+    // everything else forever. ARCHITECTURE.md rejects that explicitly.
+    // A non-zero promotion count is the aging rule actually rescuing a
+    // starved task, not merely being present in the source.
+    let background = stats[0].1;
+    selftest::check(
+        "background work is not starved",
+        background.promotions > 0 && background.dispatches > 0,
+        format_args!(
+            "background tasks were promoted past the realtime task {} time(s) after waiting, and \
+             ran {} time(s) in total - deprioritized without being frozen",
+            background.promotions, background.dispatches
+        ),
+    );
 
     // Both processes must have run to completion, in their own address
     // spaces, at the same virtual addresses.
@@ -878,6 +937,87 @@ extern "C" fn task_spinner() -> ! {
         "[Spinner] busy loop finished after {} ticks",
         arch::x86_64::interrupts::timer_ticks() - started_at
     );
+    sched::task::exit_task();
+}
+
+/// How many ticks the realtime latency probe runs for.
+///
+/// Deliberately longer than `class::STARVATION_LIMIT_TICKS`, so the
+/// anti-starvation promotion is actually exercised rather than merely
+/// present. A probe that finished before the limit would leave the most
+/// important half of the policy - that a busy Realtime Realm does not
+/// freeze everything else - completely untested, and the boot log would
+/// look identical either way.
+const LATENCY_PROBE_TICKS: u64 = sched::class::STARVATION_LIMIT_TICKS + 20;
+
+/// The largest gap, in ticks, the realtime probe ever observed between
+/// two consecutive turns on the CPU.
+///
+/// Measured by the task itself rather than read out of the scheduler's
+/// own bookkeeping, on purpose: two independent measurements of the same
+/// property agreeing is evidence, whereas a scheduler grading its own
+/// homework is not.
+static REALTIME_MAX_GAP: AtomicU64 = AtomicU64::new(0);
+
+/// Set when the latency probe finishes, so the background hogs know to
+/// stop. Without it they would spin until the machine was turned off, and
+/// the boot would never reach its summary.
+static LATENCY_TEST_DONE: AtomicBool = AtomicBool::new(false);
+
+/// A realtime task that measures how long it is ever kept waiting.
+///
+/// It never sleeps and never blocks - it busy-waits for the tick counter
+/// to move, which means it is always ready to run. The question it
+/// answers is therefore exactly the one a game asks: "when I am ready,
+/// how long until I get the CPU?" Anything above a tick or two would mean
+/// the Realtime class is not delivering the bound `sched::class`
+/// documents.
+extern "C" fn task_latency_probe() -> ! {
+    sched::task::set_current_class(sched::class::SchedClass::Realtime);
+
+    let started = arch::x86_64::interrupts::timer_ticks();
+    let mut last_seen = started;
+
+    while arch::x86_64::interrupts::timer_ticks() < started + LATENCY_PROBE_TICKS {
+        let now = arch::x86_64::interrupts::timer_ticks();
+        if now > last_seen {
+            let gap = now - last_seen;
+            REALTIME_MAX_GAP.fetch_max(gap, Ordering::SeqCst);
+            last_seen = now;
+        }
+        core::hint::spin_loop();
+    }
+
+    LATENCY_TEST_DONE.store(true, Ordering::SeqCst);
+    serial_println!(
+        "[Latency probe] realtime task finished after {} ticks - worst gap between turns was {} \
+         tick(s)",
+        LATENCY_PROBE_TICKS,
+        REALTIME_MAX_GAP.load(Ordering::SeqCst)
+    );
+    sched::task::exit_task();
+}
+
+/// A background task that wants all the CPU it can get and never yields.
+///
+/// Three of these run alongside the realtime probe. They are the
+/// contention: without them the probe would be the only runnable task and
+/// its latency would be trivially zero, which would prove nothing at all.
+extern "C" fn task_background_hog() -> ! {
+    sched::task::set_current_class(sched::class::SchedClass::Background);
+
+    // A hard tick limit as well as the flag, so a bug in the probe cannot
+    // turn these into an infinite loop that hangs the boot. A test that
+    // can hang the machine it is testing is worse than no test.
+    let started = arch::x86_64::interrupts::timer_ticks();
+    let deadline = started + LATENCY_PROBE_TICKS * 3;
+
+    while !LATENCY_TEST_DONE.load(Ordering::SeqCst)
+        && arch::x86_64::interrupts::timer_ticks() < deadline
+    {
+        core::hint::spin_loop();
+    }
+
     sched::task::exit_task();
 }
 

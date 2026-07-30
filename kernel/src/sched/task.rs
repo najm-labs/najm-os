@@ -35,6 +35,9 @@
 //! closely rather than trusting on faith.
 
 use crate::mm::kstack::{self, KernelStack};
+use crate::sched::class::{
+    ClassStats, SchedClass, PROMOTION_INTERVAL_TICKS, STARVATION_LIMIT_TICKS,
+};
 use x86_64::structures::paging::PhysFrame;
 use x86_64::VirtAddr;
 use crate::serial_println;
@@ -106,6 +109,28 @@ pub struct Task {
     /// boot path; it becomes reachable the moment processes are tasks,
     /// which is what this milestone does.
     supervisor_rsp: u64,
+    /// Which scheduling class governs this task's CPU time. See
+    /// `sched::class` for what the classes mean and why a class is more
+    /// than a priority number.
+    class: SchedClass,
+    /// The tick at which this task last became ready to run, used to
+    /// measure how long it actually waited and to detect starvation.
+    ready_since: u64,
+    /// Set when this task's current turn came from an anti-starvation
+    /// promotion rather than from its own priority.
+    ///
+    /// A promoted task runs for one tick, not for its class's full
+    /// quantum. The distinction matters: a promotion is a *rescue* - it
+    /// exists so that nothing waits forever - and letting the rescued
+    /// task then hold the CPU for a full background quantum (60 ms) would
+    /// charge that entire cost to the realtime task it jumped ahead of,
+    /// turning a bounded-latency guarantee into "bounded, except
+    /// occasionally by the longest quantum in the system".
+    promoted: bool,
+    /// How many ticks this task has held the CPU in its current turn.
+    /// Reset on every dispatch; compared against the class's quantum by
+    /// `preempt`.
+    ticks_used: u64,
     /// The process this task runs, or 0 for a pure kernel task.
     ///
     /// Lives on the `Task` rather than in a global "current pid" because
@@ -208,6 +233,10 @@ impl Task {
             stack,
             address_space_root: None,
             supervisor_rsp: 0,
+            class: SchedClass::Normal,
+            ready_since: 0,
+            promoted: false,
+            ticks_used: 0,
             pid: 0,
         }
     }
@@ -294,6 +323,10 @@ impl Task {
             stack,
             address_space_root: None,
             supervisor_rsp: 0,
+            class: SchedClass::Normal,
+            ready_since: 0,
+            promoted: false,
+            ticks_used: 0,
             pid: 0,
         }
     }
@@ -405,7 +438,15 @@ struct Scheduler {
     /// pointer has to remain valid across the `VecDeque` operations
     /// happening around it. Moving a `Box` moves a pointer; it never
     /// moves the heap allocation the pointer refers to.
-    ready_queue: VecDeque<Box<Task>>,
+    /// One ready queue per scheduling class, highest priority last so
+    /// that iterating in reverse walks them most-urgent-first.
+    ///
+    /// Separate queues rather than one sorted queue: insertion stays
+    /// O(1), the class of the next task to run is known without
+    /// comparing anything, and - most importantly - "is a higher class
+    /// waiting?" is a length check rather than a scan, which is what
+    /// makes cross-class preemption cheap enough to do on every tick.
+    ready_queues: [VecDeque<Box<Task>>; 3],
     /// The task presently running - `None` only before the very first
     /// switch (see `run_until_idle`), and after the last task exits.
     current: Option<Box<Task>>,
@@ -430,15 +471,178 @@ struct Scheduler {
     /// `run_until_idle()`, and makes the last task's exit a halt instead
     /// of a return.
     boot_stack_pointer: u64,
+    /// Per-class statistics, indexed the same way as `ready_queues`.
+    stats: [ClassStats; 3],
+    /// When the last anti-starvation promotion happened, so they can be
+    /// rate-limited - see `class::PROMOTION_INTERVAL_TICKS`.
+    last_promotion_tick: u64,
 }
 
 impl Scheduler {
+    /// Puts a task into its class's ready queue and stamps when it became
+    /// ready, which is what makes wait time measurable rather than
+    /// assumed.
+    fn enqueue(&mut self, mut task: Box<Task>, now: u64) {
+        task.ready_since = now;
+        task.promoted = false;
+        self.ready_queues[task.class as usize].push_back(task);
+    }
+
+    /// Picks the next task to run, and reports whether it was promoted
+    /// past a higher-priority class to avoid starving.
+    ///
+    /// The order of the two checks is the entire policy:
+    ///
+    /// 1. **Anything that has waited too long wins**, whatever its class.
+    ///    Without this, strict priority lets a busy Realtime Realm freeze
+    ///    everything else forever - which ARCHITECTURE.md explicitly
+    ///    rejects as the "everything else stutters" failure of naive
+    ///    priority boosting.
+    /// 2. **Otherwise the highest non-empty class wins.** This is what
+    ///    delivers the latency bound: a Realtime task never queues behind
+    ///    a Background one.
+    ///
+    /// Starvation is checked lowest-class-first, so the task that has
+    /// been waiting longest in the most-neglected class is the one
+    /// rescued.
+    fn pick_next(&mut self, now: u64) -> Option<(Box<Task>, bool)> {
+        // Rescues are rate-limited. See `class::PROMOTION_INTERVAL_TICKS`
+        // for why: without it, every task that has been waiting becomes
+        // eligible on the same tick, and they are promoted on consecutive
+        // ticks, so the realtime class's worst-case wait is set by how
+        // many tasks happened to be queued rather than by any bound.
+        let rescue_allowed =
+            now.saturating_sub(self.last_promotion_tick) >= PROMOTION_INTERVAL_TICKS;
+
+        for class in 0..self.ready_queues.len() {
+            if !rescue_allowed {
+                break;
+            }
+            let starving = self.ready_queues[class]
+                .front()
+                .is_some_and(|task| now.saturating_sub(task.ready_since) >= STARVATION_LIMIT_TICKS);
+            if starving {
+                // Only counts as a promotion if something more urgent was
+                // actually waiting - otherwise this is just the normal
+                // path taking a different route to the same task, and
+                // recording it would make the anti-starvation counter
+                // report work it did not do.
+                let outranked = self.ready_queues[class + 1..]
+                    .iter()
+                    .any(|queue| !queue.is_empty());
+                let task = self.ready_queues[class].pop_front()?;
+                if outranked {
+                    self.last_promotion_tick = now;
+                }
+                return Some((task, outranked));
+            }
+        }
+
+        for class in (0..self.ready_queues.len()).rev() {
+            if let Some(task) = self.ready_queues[class].pop_front() {
+                return Some((task, false));
+            }
+        }
+
+        None
+    }
+
+    /// Whether a task of a class strictly higher than `class` is waiting.
+    fn higher_class_waiting(&self, class: SchedClass) -> bool {
+        self.ready_queues[(class as usize + 1)..]
+            .iter()
+            .any(|queue| !queue.is_empty())
+    }
+
+    /// Whether any ready task has waited past the starvation limit.
+    fn any_starving(&self, now: u64) -> bool {
+        self.ready_queues.iter().any(|queue| {
+            queue
+                .front()
+                .is_some_and(|task| now.saturating_sub(task.ready_since) >= STARVATION_LIMIT_TICKS)
+        })
+    }
+
+    /// Whether the running task should give up the CPU now.
+    ///
+    /// The shape of this function is the scheduling policy, and getting
+    /// it wrong is subtle in a way worth recording, because the first
+    /// version of it was wrong in exactly this way:
+    ///
+    /// > *switch whenever the quantum expires*
+    ///
+    /// which sounds right and is not. A realtime task that is always
+    /// runnable would be switched away from every single tick, and the
+    /// next task chosen would be a lower-class one - because at that
+    /// moment the realtime task is `current` and therefore not in any
+    /// ready queue, so the highest *queued* class is whatever is beneath
+    /// it. The result was round-robin wearing a priority scheduler's
+    /// clothes: the realtime task's worst wait doubled to two ticks, and
+    /// the anti-starvation machinery never fired once, because nothing
+    /// was ever starved.
+    ///
+    /// The rule that is actually correct: a quantum bounds how long a
+    /// task may hold the CPU **from something else that wants it**, not
+    /// how long it may run. So expiry only forces a switch when there is
+    /// a legitimate claimant - a peer at the same class, or anything that
+    /// has been waiting long enough to be rescued. With nothing else
+    /// eligible, the quantum simply refreshes and the task keeps running,
+    /// which costs nothing and avoids a pointless context switch.
+    fn should_preempt(
+        &self,
+        class: SchedClass,
+        ticks_used: u64,
+        promoted: bool,
+        now: u64,
+    ) -> bool {
+        // A more urgent class does not wait for a quantum to expire. This
+        // is where the Realtime latency bound comes from: without it, the
+        // worst case would be set by whatever the lowest-priority task on
+        // the system was entitled to run for.
+        if self.higher_class_waiting(class) {
+            return true;
+        }
+        // A promoted task gets one tick, not its class's quantum - see
+        // `Task::promoted`.
+        let quantum = if promoted { 1 } else { class.quantum_ticks() };
+        if ticks_used < quantum {
+            return false;
+        }
+        // Quantum expired. Yield only to a genuine claimant.
+        !self.ready_queues[class as usize].is_empty() || self.any_starving(now)
+    }
+
+    fn total_ready(&self) -> usize {
+        self.ready_queues.iter().map(|queue| queue.len()).sum()
+    }
+
+    /// Records that `task` is being given the CPU now.
+    fn record_dispatch(&mut self, task: &mut Task, now: u64, promoted: bool) {
+        task.promoted = promoted;
+        task.ticks_used = 0;
+        let waited = now.saturating_sub(task.ready_since);
+        let stats = &mut self.stats[task.class as usize];
+        stats.dispatches += 1;
+        if waited > stats.max_wait_ticks {
+            stats.max_wait_ticks = waited;
+        }
+        if promoted {
+            stats.promotions += 1;
+        }
+    }
+
     const fn new() -> Self {
         Scheduler {
-            ready_queue: VecDeque::new(),
+            ready_queues: [VecDeque::new(), VecDeque::new(), VecDeque::new()],
             current: None,
             zombie: None,
             boot_stack_pointer: 0,
+            stats: [ClassStats {
+                dispatches: 0,
+                max_wait_ticks: 0,
+                promotions: 0,
+            }; 3],
+            last_promotion_tick: 0,
         }
     }
 }
@@ -461,8 +665,26 @@ pub fn spawn(entry: extern "C" fn() -> !) {
     // lock-order inversion gets introduced. Building first means only one
     // lock is ever held at a time on this path.
     let task = Box::new(Task::new(entry));
+    let now = crate::arch::x86_64::interrupts::timer_ticks();
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().ready_queue.push_back(task);
+        SCHEDULER.lock().enqueue(task, now);
+    });
+}
+
+/// Spawns a kernel task in a specific scheduling class.
+///
+/// Kernel tasks default to `Normal`; this is for the ones whose whole
+/// purpose is to exercise a class - the latency probe and the background
+/// hogs in the boot self-tests. A process gets its class from its Realm
+/// instead (see `process::spawn`), which is the path that matters for
+/// anything real.
+pub fn spawn_in_class(entry: extern "C" fn() -> !, class: SchedClass) {
+    let mut task = Task::new(entry);
+    task.class = class;
+    let task = Box::new(task);
+    let now = crate::arch::x86_64::interrupts::timer_ticks();
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().enqueue(task, now);
     });
 }
 
@@ -472,8 +694,9 @@ pub fn spawn(entry: extern "C" fn() -> !) {
 pub fn spawn_with_context(entry: extern "C" fn(*mut u8) -> !, context: *mut u8) {
     // Built before the lock is taken - see `spawn` for why.
     let task = Box::new(Task::new_with_context(entry, context));
+    let now = crate::arch::x86_64::interrupts::timer_ticks();
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().ready_queue.push_back(task);
+        SCHEDULER.lock().enqueue(task, now);
     });
 }
 
@@ -491,13 +714,16 @@ pub fn spawn_process(
     context: *mut u8,
     address_space_root: PhysFrame,
     pid: u64,
+    class: SchedClass,
 ) {
     let mut task = Task::new_with_context(entry, context);
     task.address_space_root = Some(address_space_root);
     task.pid = pid;
+    task.class = class;
     let task = Box::new(task);
+    let now = crate::arch::x86_64::interrupts::timer_ticks();
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().ready_queue.push_back(task);
+        SCHEDULER.lock().enqueue(task, now);
     });
 }
 
@@ -609,6 +835,46 @@ pub fn preempt() {
     // No interrupt-flag juggling here, unlike `yield_now`: this is only
     // ever reached from an interrupt gate, which already cleared IF, and
     // the eventual `iretq` restores the interrupted context's own flags.
+
+    // The scheduling decision, and the reason it is not simply "switch on
+    // every tick" any more.
+    //
+    // Switching unconditionally gives every task exactly one tick, which
+    // is a perfectly fair policy and precisely the wrong one: it makes
+    // the latency a task can suffer depend on how many *other* tasks
+    // exist, with no way for a Realm that needs a bound to get one, and
+    // it charges every task the cost of a context switch 100 times a
+    // second whether or not anything else wants to run.
+    //
+    // Two conditions justify taking the CPU away:
+    //
+    // 1. The running task has used its class's quantum. Longer quanta for
+    //    lower classes is what buys throughput for work that does not
+    //    care about latency.
+    // 2. A *higher* class is ready. This one is immediate and does not
+    //    wait for the quantum, and it is where the Gaming Realm's bound
+    //    actually comes from: without it, a realtime task's worst-case
+    //    wait would be set by however long the lowest-priority task on
+    //    the system was entitled to run, which is not a guarantee at all.
+    let should_switch = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut scheduler = SCHEDULER.lock();
+        let Some(current) = scheduler.current.as_mut() else {
+            // No task running - the timer ticks throughout boot. Let
+            // `plan_switch` handle it; it treats this as routine.
+            return true;
+        };
+        current.ticks_used += 1;
+        let class = current.class;
+        let used = current.ticks_used;
+        let promoted = current.promoted;
+        let now = crate::arch::x86_64::interrupts::timer_ticks();
+        scheduler.should_preempt(class, used, promoted, now)
+    });
+
+    if !should_switch {
+        return;
+    }
+
     if let Some(switch) = plan_switch(SwitchKind::Preemptive) {
         // Safety: this is only ever reached from an interrupt gate, which
         // already cleared IF, and `plan_switch` released the scheduler
@@ -651,7 +917,8 @@ enum SwitchKind {
 fn plan_switch(kind: SwitchKind) -> Option<Switch> {
     let mut scheduler = SCHEDULER.lock();
 
-    let next = scheduler.ready_queue.pop_front()?;
+    let now = crate::arch::x86_64::interrupts::timer_ticks();
+    let (next, promoted) = scheduler.pick_next(now)?;
 
     let mut current = match scheduler.current.take() {
         Some(current) => current,
@@ -659,7 +926,7 @@ fn plan_switch(kind: SwitchKind) -> Option<Switch> {
             // Put back what was just taken - failing to would silently
             // drop a task (and free its stack out from under a `Task`
             // that may never have run).
-            scheduler.ready_queue.push_front(next);
+            scheduler.ready_queues[next.class as usize].push_front(next);
 
             return match kind {
                 // The timer ticks throughout boot, before any task is
@@ -691,7 +958,10 @@ fn plan_switch(kind: SwitchKind) -> Option<Switch> {
         next_address_space: next.address_space_root,
     };
 
-    scheduler.ready_queue.push_back(current);
+    let mut next = next;
+    scheduler.record_dispatch(&mut next, now, promoted);
+    current.ticks_used = 0;
+    scheduler.enqueue(current, now);
     scheduler.current = Some(next);
 
     Some(switch)
@@ -867,8 +1137,11 @@ pub fn exit_task() -> ! {
         // dead task - never to the stack currently executing.
         let reaped = scheduler.zombie.replace(dying);
 
-        match scheduler.ready_queue.pop_front() {
-            Some(next) => {
+        let now = crate::arch::x86_64::interrupts::timer_ticks();
+        match scheduler.pick_next(now) {
+            Some((next, promoted)) => {
+                let mut next = next;
+                scheduler.record_dispatch(&mut next, now, promoted);
                 let next_stack = next.stack_pointer;
                 let top = next.kernel_rsp0();
                 let space = next.address_space_root;
@@ -947,13 +1220,47 @@ fn reap_zombie() {
     drop(zombie);
 }
 
+/// Per-class scheduling statistics: `(class, dispatches, max wait in
+/// ticks, promotions)`.
+///
+/// The max-wait figure is the one that matters. A scheduler that
+/// *claims* bounded latency and one that delivers it produce identical
+/// code until something measures the wait, so this is measured on every
+/// dispatch and reported at the end of boot.
+pub fn class_stats() -> [(SchedClass, ClassStats); 3] {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let scheduler = SCHEDULER.lock();
+        [
+            (SchedClass::Background, scheduler.stats[0]),
+            (SchedClass::Normal, scheduler.stats[1]),
+            (SchedClass::Realtime, scheduler.stats[2]),
+        ]
+    })
+}
+
+/// Sets the calling task's scheduling class.
+///
+/// Used by kernel test tasks to place themselves in a class without
+/// going through the process machinery. Not exposed to userland: a
+/// process's class comes from its Realm, and a syscall that let a program
+/// choose would make the Realm model advisory - exactly the "any
+/// application requests elevated placement and receives it" failure
+/// ARCHITECTURE.md section 2e is about.
+pub fn set_current_class(class: SchedClass) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(current) = SCHEDULER.lock().current.as_mut() {
+            current.class = class;
+        }
+    });
+}
+
 /// How many tasks are queued or running right now. Reported by the boot
 /// self-tests so "the scheduler drained" is an observation rather than an
 /// assumption.
 pub fn task_count() -> usize {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let scheduler = SCHEDULER.lock();
-        scheduler.ready_queue.len() + usize::from(scheduler.current.is_some())
+        scheduler.total_ready() + usize::from(scheduler.current.is_some())
     })
 }
 
@@ -976,8 +1283,11 @@ pub fn task_count() -> usize {
 pub fn run_until_idle() {
     let next_stack = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut scheduler = SCHEDULER.lock();
-        match scheduler.ready_queue.pop_front() {
-            Some(next) => {
+        let now = crate::arch::x86_64::interrupts::timer_ticks();
+        match scheduler.pick_next(now) {
+            Some((next, promoted)) => {
+                let mut next = next;
+                scheduler.record_dispatch(&mut next, now, promoted);
                 let next_stack = next.stack_pointer;
                 scheduler.current = Some(next);
                 Some(next_stack)
@@ -1059,9 +1369,9 @@ pub fn start() -> ! {
     // lock and releasing it would deadlock against `preempt`.
     let next_stack = x86_64::instructions::interrupts::without_interrupts(|| {
         let mut scheduler = SCHEDULER.lock();
-        let next = scheduler
-            .ready_queue
-            .pop_front()
+        let now = crate::arch::x86_64::interrupts::timer_ticks();
+        let (next, _) = scheduler
+            .pick_next(now)
             .expect("scheduler::start() called with no tasks spawned - spawn() at least one first");
         let next_stack = next.stack_pointer;
         scheduler.current = Some(next);

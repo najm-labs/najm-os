@@ -218,7 +218,12 @@ pub fn spawn(image: LoadedImage, profile: RealmProfile) -> u64 {
     // here, while the pointer is still known-good, because the scheduler
     // needs it before the task's entry point ever runs.
     let root = unsafe { (*(context_ptr as *mut ProcessContext)).address_space.root_frame() };
-    task::spawn_process(process_entry, context_ptr, root, pid);
+    // The Realm decides the scheduling class. This is the line that
+    // makes ARCHITECTURE.md's claim - that a Realm is defined partly by a
+    // *scheduler class, not just a priority number* - true of the running
+    // system rather than only of the document.
+    let class = crate::sched::class::SchedClass::for_realm(profile.kind);
+    task::spawn_process(process_entry, context_ptr, root, pid, class);
 
     pid
 }
