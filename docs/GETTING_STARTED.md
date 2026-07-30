@@ -374,7 +374,13 @@ smallest possible working slice. The next milestones, in order (see
     bound to ABI-translation thunks, and runs at Ring 3. Four Win32
     functions, against Wine's tens of thousands - see that module's docs
     for exactly where the line is.
-24. ~~Najm Store package verification.~~ Done - see `kernel/src/store.rs`
+24. ~~Capability-gated IPC.~~ Done - see `kernel/src/ipc.rs`. Named
+    ports carrying copied messages, with creating a port and connecting
+    to one gated as separate rights - creating claims a name in a global
+    namespace, which is how a service gets impersonated. Bounded queues
+    that refuse rather than block or drop, and ports reclaimed when their
+    owner exits, without which restarting a service would fail.
+25. ~~Najm Store package verification.~~ Done - see `kernel/src/store.rs`
     and `docs/APP_SDK.md`. SHA-256 integrity checking against FIPS
     180-4's own vectors, and ARCHITECTURE.md 2e's Realm assignment
     policy: elevation is a credential, not a declaration, and the
@@ -426,10 +432,12 @@ The gaps that block the most, in the order they block it:
    nowhere to write it. This needs a disk driver (AHCI) and a writable
    filesystem, and it blocks the Store, the app SDK and ordinary use
    equally.
-2. **IPC.** The syscall numbers are reserved (`abi/src/lib.rs`) and
-   nothing implements them. Every service that should be a separate
-   process is currently in the kernel because there is no other way for
-   it to be reached.
+2. **Blocking IPC.** Ports work (`kernel/src/ipc.rs`), but `recv` on an
+   empty queue returns `EAGAIN` rather than sleeping, because there is no
+   wait queue and no way to wake a task on an event. Clients poll, which
+   is correct and wasteful. Fixing it means a sleep/wake primitive in the
+   scheduler - and that is also what `sleep_ticks` and a faithful
+   `Sleep()` in Mirage need, so it unblocks three things at once.
 3. **Ed25519**, without which no package can ever be elevated to Vault.
 4. **Mirage's API surface.** Four functions. See `docs/APP_SDK.md` for
    why this is both the highest-value and the longest-running item.

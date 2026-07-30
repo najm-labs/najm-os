@@ -49,6 +49,7 @@ mod arch;
 mod drivers;
 mod fs;
 mod graphics;
+mod ipc;
 mod loader;
 mod mirage;
 mod mm;
@@ -990,6 +991,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ),
         );
     }
+
+    let (ports, queued, refused) = ipc::stats();
+    selftest::check(
+        "IPC ports reclaimed on exit",
+        ports == 0,
+        format_args!(
+            "{} port(s) remain after every process exited ({} message(s) still queued, {} send(s) \
+             refused) - a dead service's name must not stay claimed, or restarting it would fail",
+            ports, queued, refused
+        ),
+    );
 
     for (pid, name, state) in process::snapshot() {
         serial_println!("Najm Kernel: process {} ({}) - {:?}", pid, name, state);

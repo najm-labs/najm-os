@@ -79,6 +79,9 @@ pub const HOME: RealmProfile = RealmProfile {
     capabilities: najm_abi::capability_bits::SERIAL_WRITE
         | najm_abi::capability_bits::TIMER_READ
         | najm_abi::capability_bits::FILE_READ
+        // Both IPC rights: a Home Realm application offering a service to
+        // other applications is ordinary, not privileged.
+        | najm_abi::capability_bits::IPC_CREATE
         | najm_abi::capability_bits::IPC_CONNECT
         | najm_abi::capability_bits::SURFACE_CREATE
         | najm_abi::capability_bits::INPUT_READ,

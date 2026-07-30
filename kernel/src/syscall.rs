@@ -115,6 +115,12 @@ pub extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64, rsp_at_
         sys::READDIR => sys_readdir(arg1, arg2, arg3),
         sys::WRITE_CSTR => sys_write_cstr(arg1),
 
+        sys::PORT_CREATE => sys_port_create(arg1, arg2),
+        sys::PORT_CONNECT => sys_port_connect(arg1, arg2),
+        sys::PORT_SEND => sys_port_send(arg1, arg2, arg3),
+        sys::PORT_RECV => sys_port_recv(arg1, arg2, arg3),
+        sys::PORT_CLOSE => sys_port_close(arg1),
+
         sys::SURFACE_CREATE => sys_surface_create(arg1, arg2),
         sys::SURFACE_COMMIT => sys_surface_commit(arg1, arg2, arg3),
         sys::SURFACE_INFO => sys_surface_info(arg1, arg2),
@@ -729,4 +735,144 @@ fn sys_write_cstr(ptr: u64) -> u64 {
     }
 
     sys_write(fd::STDOUT, ptr, length as u64)
+}
+
+/// Maps an IPC error onto the ABI's error numbers.
+///
+/// A separate function rather than an inline match at each call site, so
+/// that "queue full" and "queue empty" cannot end up reported as
+/// different things by different syscalls - they are the same condition
+/// from the caller's point of view (try again later) and the same error.
+fn ipc_error(error: crate::ipc::IpcError) -> u64 {
+    use crate::ipc::IpcError;
+    encode_error(match error {
+        IpcError::BadName => err::EINVAL,
+        IpcError::NameTaken => err::EEXIST,
+        IpcError::NotFound => err::ENOENT,
+        IpcError::BadHandle => err::EBADF,
+        IpcError::TooLarge => err::EINVAL,
+        IpcError::WouldBlock => err::EAGAIN,
+        IpcError::Exhausted => err::ENOMEM,
+    })
+}
+
+/// `port_create(name_ptr, name_len) -> handle`
+fn sys_port_create(name_ptr: u64, name_len: u64) -> u64 {
+    // Creating a port claims a name in a global namespace, which is how a
+    // service gets impersonated - so it is a strictly stronger right than
+    // connecting to one, and gated separately.
+    if let Err(e) = require(najm_abi::capability_bits::IPC_CREATE) {
+        return e;
+    }
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return encode_error(err::EPERM);
+    }
+
+    let Some(name) = read_ipc_name(name_ptr, name_len) else {
+        return encode_error(err::EINVAL);
+    };
+
+    match crate::ipc::create(pid, &name) {
+        Ok(handle) => handle,
+        Err(error) => ipc_error(error),
+    }
+}
+
+/// `port_connect(name_ptr, name_len) -> handle`
+fn sys_port_connect(name_ptr: u64, name_len: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::IPC_CONNECT) {
+        return e;
+    }
+
+    let Some(name) = read_ipc_name(name_ptr, name_len) else {
+        return encode_error(err::EINVAL);
+    };
+
+    match crate::ipc::connect(&name) {
+        Ok(handle) => handle,
+        Err(error) => ipc_error(error),
+    }
+}
+
+/// `port_send(handle, ptr, len) -> bytes sent`
+fn sys_port_send(handle: u64, ptr: u64, len: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::IPC_CONNECT) {
+        return e;
+    }
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return encode_error(err::EPERM);
+    }
+
+    // Checked before the copy, not after. Copying first and then
+    // rejecting would let a caller make the kernel allocate an arbitrary
+    // buffer just to have it thrown away - the allocation is the cost,
+    // not the queueing.
+    if len as usize > crate::ipc::MAX_MESSAGE {
+        return encode_error(err::EINVAL);
+    }
+
+    let Some(bytes) = crate::mm::memory::copy_from_user(ptr, len as usize) else {
+        return encode_error(err::EFAULT);
+    };
+
+    match crate::ipc::send(pid, handle, bytes) {
+        Ok(sent) => sent as u64,
+        Err(error) => ipc_error(error),
+    }
+}
+
+/// `port_recv(handle, ptr, len) -> bytes received`
+///
+/// Non-blocking: an empty queue returns `EAGAIN` rather than sleeping,
+/// because there is no wait queue and no way to wake a task on an event
+/// yet. A client polls, which is correct and wasteful - see the module
+/// docs in `crate::ipc`.
+fn sys_port_recv(handle: u64, ptr: u64, len: u64) -> u64 {
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return encode_error(err::EPERM);
+    }
+
+    // No capability check here, and deliberately: receiving is gated by
+    // *ownership* rather than by a right. Only the process that created a
+    // port may read from it, which `ipc::recv` enforces - a capability
+    // check as well would be a second, weaker gate in front of a stronger
+    // one, and the weaker one is the one someone would eventually relax.
+    let message = match crate::ipc::recv(pid, handle) {
+        Ok(message) => message,
+        Err(error) => return ipc_error(error),
+    };
+
+    let want = core::cmp::min(message.bytes.len(), len as usize);
+    match crate::mm::memory::copy_to_user(ptr, &message.bytes[..want]) {
+        // The message is consumed either way. A receive that put it back
+        // on failure would need the queue to accept a push at the *front*
+        // under a lock it no longer holds, and the failure case here is a
+        // caller that passed a bad pointer - which has bigger problems
+        // than a lost message.
+        Some(written) => written as u64,
+        None => encode_error(err::EFAULT),
+    }
+}
+
+/// `port_close(handle)`
+fn sys_port_close(handle: u64) -> u64 {
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return encode_error(err::EPERM);
+    }
+    match crate::ipc::close(pid, handle) {
+        Ok(()) => 0,
+        Err(error) => ipc_error(error),
+    }
+}
+
+/// Copies and length-checks a port name from userland.
+fn read_ipc_name(ptr: u64, len: u64) -> Option<alloc::vec::Vec<u8>> {
+    if len == 0 || len as usize > crate::ipc::MAX_NAME {
+        return None;
+    }
+    crate::mm::memory::copy_from_user(ptr, len as usize)
 }

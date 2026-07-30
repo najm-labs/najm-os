@@ -38,6 +38,7 @@ pub extern "C" fn _start() -> ! {
     check_seek();
     check_readdir();
     check_refusals();
+    check_ipc();
 
     sys::exit(SUCCESS);
 }
@@ -317,6 +318,97 @@ fn check_refusals() {
         }
         let _ = sys::close(descriptor);
     }
+}
+
+/// Ports: the round trip, and the refusals.
+///
+/// This process is in the Home Realm, which holds both IPC rights - a
+/// Home application offering a service to other applications is ordinary.
+/// A Gaming Realm process holds neither, which is what makes the
+/// capability check here more than decoration.
+fn check_ipc() {
+    const NAME: &[u8] = b"os.najm.fstest";
+
+    let Ok(port) = sys::port_create(NAME) else {
+        let _ = sys::write(b"[fstest] BAD: port_create failed\n");
+        return;
+    };
+
+    // Claiming the same name twice must fail. Without this check, a
+    // second process could register a name a service already holds and
+    // receive messages meant for it - which is the whole reason creating
+    // a port is a stronger right than connecting to one.
+    match sys::port_create(NAME) {
+        Err(e) if sys::is_eexist(e) => {
+            let _ = sys::write(b"[fstest] good: claiming a port name twice was refused\n");
+        }
+        _ => {
+            let _ = sys::write(b"[fstest] BAD: a port name was claimed twice\n");
+        }
+    }
+
+    // Receiving from an empty queue must return EAGAIN, not block and not
+    // succeed with zero bytes. A zero-length success is indistinguishable
+    // from an empty message, which is a real thing to send.
+    let mut buffer = [0u8; 64];
+    match sys::port_recv(port, &mut buffer) {
+        Err(e) if sys::is_eagain(e) => {
+            let _ = sys::write(b"[fstest] good: receiving from an empty port gave EAGAIN\n");
+        }
+        _ => {
+            let _ = sys::write(b"[fstest] BAD: an empty port did not report EAGAIN\n");
+        }
+    }
+
+    // The round trip. Connecting by name must find the port this process
+    // just created, and the bytes must arrive unchanged.
+    let Ok(connected) = sys::port_connect(NAME) else {
+        let _ = sys::write(b"[fstest] BAD: port_connect could not find the port\n");
+        return;
+    };
+
+    const MESSAGE: &[u8] = b"ping";
+    if sys::port_send(connected, MESSAGE).is_err() {
+        let _ = sys::write(b"[fstest] BAD: port_send failed\n");
+        return;
+    }
+
+    match sys::port_recv(port, &mut buffer) {
+        Ok(received) if &buffer[..received as usize] == MESSAGE => {
+            let _ = sys::write(b"[fstest] good: a message survived the round trip intact: ");
+            let _ = sys::write(&buffer[..received as usize]);
+            let _ = sys::write(b"\n");
+        }
+        _ => {
+            let _ = sys::write(b"[fstest] BAD: the message did not survive the round trip\n");
+        }
+    }
+
+    // Connecting to a name nobody registered must fail, rather than
+    // creating one implicitly - which would let a typo silently produce a
+    // port that no service is listening on.
+    match sys::port_connect(b"os.najm.nonexistent") {
+        Err(e) if sys::is_enoent(e) => {
+            let _ = sys::write(b"[fstest] good: connecting to an unregistered name gave ENOENT\n");
+        }
+        _ => {
+            let _ = sys::write(b"[fstest] BAD: connecting to an unregistered name succeeded\n");
+        }
+    }
+
+    // A message larger than the kernel's limit must be refused before it
+    // is copied - the allocation is the cost, not the queueing.
+    let oversized = [0u8; 8192];
+    match sys::port_send(connected, &oversized) {
+        Err(e) if sys::is_einval(e) => {
+            let _ = sys::write(b"[fstest] good: an oversized message was refused\n");
+        }
+        _ => {
+            let _ = sys::write(b"[fstest] BAD: an oversized message was accepted\n");
+        }
+    }
+
+    let _ = sys::port_close(port);
 }
 
 /// Required by `#![no_std]`.

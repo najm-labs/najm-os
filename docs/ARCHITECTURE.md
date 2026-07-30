@@ -136,7 +136,7 @@ This is explicitly the highest-risk part of the project and where outside contri
 
 ## 7. Open Questions
 
-- Exact IPC mechanism and its performance characteristics under Gaming Realm latency constraints. The syscall numbers are reserved (`abi/src/lib.rs`) and nothing implements them yet, which is why every service that should be a separate process is currently inside the kernel.
+- IPC exists (`kernel/src/ipc.rs`): named ports carrying copied messages, with `IPC_CREATE` and `IPC_CONNECT` as separate rights. Two things remain open. **Blocking receive** needs a sleep/wake primitive the scheduler does not have, so clients poll today. **Handle passing** - a message carrying a capability, so a service can delegate a right to a client - is the natural next step and is genuinely missing. Message copying rather than shared memory is a deliberate choice, argued in that module: shared memory makes every service a time-of-check/time-of-use problem, and bulk transfer wants a separate mechanism with explicit handoff rather than this one relaxed.
 - **Persistence.** The filesystem is read-only and lives in the boot image. This blocks the Store, the app SDK and ordinary use equally, and is the single most useful thing to build next.
 - Whether filesystem logic lives in the privileged core or as an isolated service (trade-off between crash-resilience and I/O latency).
 - GPU passthrough mechanism for Gaming Realm without a full virtualization layer.

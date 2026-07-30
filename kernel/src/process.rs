@@ -267,6 +267,11 @@ extern "C" fn process_entry(context_ptr: *mut u8) -> ! {
     // valid, so a later process reusing one would inherit its pixels.
     crate::graphics::compositor::remove_surfaces_for(context.pid);
 
+    // And its ports. Without this a dead service's name stays claimed
+    // forever, so restarting it - the entire point of "isolated,
+    // restartable service processes" - would fail with EEXIST.
+    crate::ipc::close_all_for(context.pid);
+
     // Dropping the context drops the `AddressSpace`, which returns every
     // frame the process owned - its pages, its stack, and the page tables
     // that reached them - to `mm::frame_pool`.

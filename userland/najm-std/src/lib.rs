@@ -373,3 +373,61 @@ pub fn realm_info(info: &mut najm_abi::RealmInfo) -> Result<u64, u64> {
 pub fn is_enomem(e: u64) -> bool {
     e == err::ENOMEM
 }
+
+// --- IPC ------------------------------------------------------------
+
+/// Creates a named port, returning a handle.
+///
+/// Requires `IPC_CREATE`, which is a strictly stronger right than
+/// connecting: creating a port claims a name in a global namespace, which
+/// is how a service gets impersonated.
+pub fn port_create(name: &[u8]) -> Result<u64, u64> {
+    // Safety: `name` is a real slice; pointer and length are consistent.
+    decode(unsafe { syscall3(sys::PORT_CREATE, name.as_ptr() as u64, name.len() as u64, 0) })
+}
+
+/// Finds an existing port by name.
+pub fn port_connect(name: &[u8]) -> Result<u64, u64> {
+    // Safety: as `port_create`.
+    decode(unsafe { syscall3(sys::PORT_CONNECT, name.as_ptr() as u64, name.len() as u64, 0) })
+}
+
+/// Queues a message, returning how many bytes were sent.
+///
+/// Fails with `EAGAIN` when the queue is full rather than blocking or
+/// dropping - the sender is the only party that knows whether a
+/// particular message is worth retrying.
+pub fn port_send(handle: u64, bytes: &[u8]) -> Result<u64, u64> {
+    // Safety: `bytes` is a real slice.
+    decode(unsafe {
+        syscall3(sys::PORT_SEND, handle, bytes.as_ptr() as u64, bytes.len() as u64)
+    })
+}
+
+/// Takes the oldest message into `buf`, returning how many bytes arrived.
+///
+/// Non-blocking: an empty queue is `EAGAIN`, not a wait. Only the process
+/// that created the port may receive from it.
+pub fn port_recv(handle: u64, buf: &mut [u8]) -> Result<u64, u64> {
+    // Safety: `buf` is a real mutable slice, and the kernel writes at
+    // most `buf.len()` bytes into it.
+    decode(unsafe {
+        syscall3(sys::PORT_RECV, handle, buf.as_mut_ptr() as u64, buf.len() as u64)
+    })
+}
+
+/// Destroys a port. Only its owner may.
+pub fn port_close(handle: u64) -> Result<u64, u64> {
+    // Safety: no pointer arguments.
+    decode(unsafe { syscall3(sys::PORT_CLOSE, handle, 0, 0) })
+}
+
+/// Whether `e` is the "try again later" error - a full or empty queue.
+pub fn is_eagain(e: u64) -> bool {
+    e == err::EAGAIN
+}
+
+/// Whether `e` is the "already exists" error.
+pub fn is_eexist(e: u64) -> bool {
+    e == err::EEXIST
+}
