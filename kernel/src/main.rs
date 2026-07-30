@@ -1336,6 +1336,11 @@ extern "C" fn task_background_hog() -> ! {
 /// to do.
 pub(crate) fn halt_loop() -> ! {
     loop {
+        // Safety: `hlt` is a privileged instruction, and this function is
+        // only ever reached at Ring 0 - a Ring 3 program executing it
+        // faults, which is precisely what the usermode self-test relies
+        // on. The options are accurate: it touches no memory, uses no
+        // stack, and preserves flags.
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
