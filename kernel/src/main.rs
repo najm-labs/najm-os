@@ -57,6 +57,7 @@ mod realm;
 mod sched;
 mod security;
 mod selftest;
+mod store;
 mod syscall;
 
 use alloc::vec::Vec;
@@ -655,6 +656,55 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             None
         }
     };
+
+    // The Store's verification path. Two packages are in the archive:
+    // one intact and one with a flipped byte, both requesting the Vault
+    // Realm. Neither gets it.
+    selftest::check(
+        "SHA-256 against FIPS 180-4 vectors",
+        security::sha256::selftest_vectors(),
+        format_args!(
+            "the hash matches the standard's own test vectors, including the 56-byte case where \
+             padding needs a second block"
+        ),
+    );
+
+    let packages = store::scan("/apps");
+    for verdict in &packages {
+        store::report(verdict);
+    }
+
+    let intact = packages.iter().find(|v| v.integrity_ok);
+    let tampered = packages.iter().find(|v| !v.integrity_ok);
+
+    selftest::check(
+        "package integrity",
+        intact.is_some() && tampered.is_some(),
+        format_args!(
+            "of {} package(s), the intact one verified against its digest and the one with a \
+             flipped byte did not - a verifier that has only seen valid input is a verifier \
+             nobody has tested",
+            packages.len()
+        ),
+    );
+
+    // The security-critical one. ARCHITECTURE.md 2e: elevation is a
+    // credential, not a declaration. Both packages ask for Vault; both
+    // must get Home, because signature verification is unimplemented and
+    // fails closed. A package that asked for Vault and received it would
+    // be the failure here, not the success.
+    let all_denied = packages
+        .iter()
+        .all(|v| v.granted_realm.kind == najm_abi::realm_kind::HOME);
+    selftest::check(
+        "Realm elevation requires a credential",
+        !packages.is_empty() && all_denied,
+        format_args!(
+            "every package requested the Vault Realm and every one was placed in Home, because \
+             none carries a verified publisher signature - the unimplemented verifier denies \
+             elevation rather than granting it"
+        ),
+    );
 
     // A Windows binary, through Mirage. Placed in the Gaming Realm
     // because that is what the layer exists for - see `crate::mirage` for

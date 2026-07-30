@@ -680,6 +680,172 @@ fn build_test_pe() -> Vec<u8> {
     pe
 }
 
+
+/// Builds a signed-format Najm package, for the Store's verification
+/// path.
+///
+/// Two are produced at build time: one intact, and one with a single byte
+/// of its payload flipped. The second is the important one - a
+/// verification routine that has only ever seen valid input is a
+/// verification routine nobody has tested.
+///
+/// Both *request* the Vault Realm. Neither gets it, because neither
+/// carries a verified publisher signature, and that is the behaviour
+/// ARCHITECTURE.md 2e requires: elevation is a credential, not a
+/// declaration. A package asking for Vault and receiving it would be the
+/// failure, not the success.
+fn build_package(manifest: &str, files: &[(&str, Vec<u8>)], corrupt: bool) -> Vec<u8> {
+    let manifest_bytes = manifest.as_bytes();
+    let mut payload = build_archive(files);
+
+    // The digest covers the manifest and the payload together, in one
+    // pass. Hashing them separately would let a package be assembled from
+    // a manifest signed for one payload and a payload signed for another.
+    //
+    // Computed here, *before* any corruption is applied. Getting that
+    // order wrong is not a hypothetical - the first version of this
+    // function corrupted the payload first and then hashed it, so the
+    // "tampered" package carried a digest of its own tampered contents
+    // and verified perfectly. The test passed on a verifier that could
+    // not detect tampering at all, which is precisely the failure a
+    // negative test exists to catch and precisely the way it can fail to.
+    let digest = {
+        // A tiny SHA-256, duplicated here rather than shared with the
+        // kernel's: the kernel's is `no_std` and lives in a crate the
+        // build script cannot link. Keeping them in step is what the
+        // kernel's own FIPS test vectors are for - if either drifts, that
+        // test fails rather than packages silently failing to verify.
+        let mut hasher = Sha256::new();
+        hasher.update(manifest_bytes);
+        hasher.update(&payload);
+        hasher.finish()
+    };
+
+    if corrupt {
+        // Flip one bit, after the digest was computed - so the package's
+        // recorded digest describes what it *was*, not what it now is.
+        // As far into the payload as possible, in the file data itself: a
+        // corruption in the archive header would be caught by the archive
+        // parser before the digest check ever mattered, testing the wrong
+        // thing.
+        let target = payload.len() - 1;
+        payload[target] ^= 0x01;
+    }
+
+    let mut package = Vec::new();
+    package.extend_from_slice(b"NAJMPKG\0");
+    package.extend_from_slice(&1u32.to_le_bytes());
+    package.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+    package.extend_from_slice(&digest);
+    package.extend_from_slice(manifest_bytes);
+    package.extend_from_slice(&payload);
+    package
+}
+
+/// SHA-256, for the build script.
+///
+/// Duplicated from the kernel's implementation because the kernel's is in
+/// a `no_std` crate this script cannot link against. The duplication is
+/// real and worth naming: two implementations of one hash can drift. What
+/// stops that mattering is that the kernel checks itself against FIPS
+/// 180-4's own test vectors at every boot, so a divergence shows up as a
+/// failed self-test rather than as packages that mysteriously will not
+/// verify.
+struct Sha256 {
+    state: [u32; 8],
+    buffer: Vec<u8>,
+}
+
+impl Sha256 {
+    fn new() -> Sha256 {
+        Sha256 {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+
+        let length_bits = (self.buffer.len() as u64) * 8;
+        self.buffer.push(0x80);
+        while self.buffer.len() % 64 != 56 {
+            self.buffer.push(0);
+        }
+        self.buffer.extend_from_slice(&length_bits.to_be_bytes());
+
+        for block in self.buffer.chunks(64) {
+            let mut w = [0u32; 64];
+            for index in 0..16 {
+                w[index] =
+                    u32::from_be_bytes(block[index * 4..index * 4 + 4].try_into().unwrap());
+            }
+            for index in 16..64 {
+                let s0 = w[index - 15].rotate_right(7)
+                    ^ w[index - 15].rotate_right(18)
+                    ^ (w[index - 15] >> 3);
+                let s1 = w[index - 2].rotate_right(17)
+                    ^ w[index - 2].rotate_right(19)
+                    ^ (w[index - 2] >> 10);
+                w[index] = w[index - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[index - 7])
+                    .wrapping_add(s1);
+            }
+
+            let mut v = self.state;
+            for index in 0..64 {
+                let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+                let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+                let temp1 = v[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[index])
+                    .wrapping_add(w[index]);
+                let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+                let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+                let temp2 = s0.wrapping_add(maj);
+                v[7] = v[6];
+                v[6] = v[5];
+                v[5] = v[4];
+                v[4] = v[3].wrapping_add(temp1);
+                v[3] = v[2];
+                v[2] = v[1];
+                v[1] = v[0];
+                v[0] = temp1.wrapping_add(temp2);
+            }
+
+            for (slot, value) in self.state.iter_mut().zip(v) {
+                *slot = slot.wrapping_add(value);
+            }
+        }
+
+        let mut digest = [0u8; 32];
+        for (index, word) in self.state.iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+}
+
 fn main() {
     let kernel_path = PathBuf::from(env::var_os("KERNEL_PATH").unwrap_or_else(|| {
         panic!(
@@ -839,6 +1005,40 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-env-changed=USERLAND_GUI_PATH");
+
+    // Two packages: one intact, one with a flipped byte. Both request the
+    // Vault Realm and neither will get it, which is the point - see
+    // kernel/src/store.rs and ARCHITECTURE.md 2e.
+    let sample_manifest = "\
+# A Najm Store package manifest. Everything here is a claim the package
+# makes about itself - see kernel/src/store.rs for which claims are
+# treated as requests and which are ignored outright.
+id        = os.najm.notes
+name      = Notes
+version   = 1.0.0
+publisher = Najm Labs (UNVERIFIED - no signature is attached)
+entry     = /bin/notes
+
+# This is a *request*. It is read, logged, and refused, because elevation
+# above Home requires a signature from a publisher verified in advance.
+realm = vault
+
+capability = file_read
+capability = surface_create
+";
+    let package_files: Vec<(&str, Vec<u8>)> = vec![(
+        "/bin/notes",
+        b"a placeholder for the packaged program's binary\n".to_vec(),
+    )];
+
+    files.push((
+        "/apps/notes.najm",
+        build_package(sample_manifest, &package_files, false),
+    ));
+    files.push((
+        "/apps/tampered.najm",
+        build_package(sample_manifest, &package_files, true),
+    ));
 
     std::fs::write(&ramdisk_path, build_archive(&files))
         .expect("failed to write the boot archive");

@@ -9,8 +9,14 @@
 # kernel says out loud what it proved, and this script only judges. It
 # does not know what any individual test means - it looks for the failure
 # vocabulary the kernel is contractually required to use (FAILURE,
-# MISALIGNED, PANIC, EXCEPTION at Ring 0) and for the end-of-run summary
-# line that only prints if the kernel got all the way through.
+# MISALIGNED, PANIC, BAD:) and for the end-of-run summary line that only
+# prints if the kernel got all the way through.
+#
+# That vocabulary is reserved, and the reservation is load-bearing. Code
+# that *correctly rejects* something - a corrupted package, a refused
+# capability - must not use those words, or a passing test reads as a
+# broken kernel. See the comment in kernel/src/store.rs where exactly that
+# happened.
 #
 # Two things here exist because of specific traps documented in
 # docs/GETTING_STARTED.md:

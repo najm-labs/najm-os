@@ -5,3 +5,4 @@
 //! installer/package layer for it to actually verify.
 
 pub mod capability;
+pub mod sha256;
