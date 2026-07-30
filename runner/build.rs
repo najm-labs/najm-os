@@ -119,8 +119,10 @@ fn build_test_elf() -> Vec<u8> {
 /// reports a general protection fault for this program, `exit` silently
 /// failed to end it.
 fn build_syscall_test_elf() -> Vec<u8> {
-    const LOAD_VADDR: u64 = 0x0050_0000; // distinct from build_test_elf's 0x400000
-    const BSS_OFFSET: u64 = 0x1000; // one page past the code - only valid if p_memsz covers it
+    const LOAD_VADDR: u64 = najm_abi::layout::USER_FALLBACK_IMAGE_BASE;
+    // One page past the code, and therefore in the *second* PT_LOAD
+    // segment - see the two-segment layout below.
+    const BSS_OFFSET: u64 = 0x1000;
     let bss_target = LOAD_VADDR + BSS_OFFSET;
 
     // Must match the kernel's own syscall numbers (see `SYS_EXIT` /
@@ -198,11 +200,8 @@ fn build_syscall_test_elf() -> Vec<u8> {
 
     const EHDR_SIZE: u64 = 64;
     const PHDR_SIZE: u64 = 56;
-    let payload_offset = EHDR_SIZE + PHDR_SIZE;
-    // p_memsz spans the code plus a full extra page beyond it, so
-    // `bss_target` (one page past LOAD_VADDR) falls inside the segment's
-    // declared memory range but strictly after its file-backed range.
-    let mem_size = BSS_OFFSET + 0x1000;
+    const PHDR_COUNT: u64 = 2;
+    let payload_offset = EHDR_SIZE + PHDR_SIZE * PHDR_COUNT;
 
     let mut elf = Vec::new();
 
@@ -222,22 +221,51 @@ fn build_syscall_test_elf() -> Vec<u8> {
     elf.extend_from_slice(&0u32.to_le_bytes());
     elf.extend_from_slice(&(EHDR_SIZE as u16).to_le_bytes());
     elf.extend_from_slice(&(PHDR_SIZE as u16).to_le_bytes());
-    elf.extend_from_slice(&1u16.to_le_bytes());
+    elf.extend_from_slice(&(PHDR_COUNT as u16).to_le_bytes());
     elf.extend_from_slice(&0u16.to_le_bytes());
     elf.extend_from_slice(&0u16.to_le_bytes());
     elf.extend_from_slice(&0u16.to_le_bytes());
     assert_eq!(elf.len() as u64, EHDR_SIZE);
 
-    // --- Program header ---
+    // --- Program header 1: the code. Read + execute, never writable. ---
+    //
+    // This was one RWX segment until the kernel started deriving page
+    // permissions from p_flags and enforcing W^X. A single writable-and-
+    // executable segment is now *refused* at load time, which is the
+    // right outcome - it described a program whose code could be
+    // rewritten at runtime and whose data could be executed. Splitting it
+    // costs one extra program header and a page of padding.
     elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-    elf.extend_from_slice(&7u32.to_le_bytes()); // PF_R | PF_W | PF_X - writable this time, for the BSS write
+    elf.extend_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
     elf.extend_from_slice(&payload_offset.to_le_bytes());
     elf.extend_from_slice(&LOAD_VADDR.to_le_bytes());
     elf.extend_from_slice(&LOAD_VADDR.to_le_bytes());
-    elf.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // p_filesz: just the code
-    elf.extend_from_slice(&mem_size.to_le_bytes()); // p_memsz: code + a full extra zero-filled page
+    elf.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // p_filesz
+    elf.extend_from_slice(&(payload.len() as u64).to_le_bytes()); // p_memsz - no .bss in this one
     elf.extend_from_slice(&0x1000u64.to_le_bytes());
-    assert_eq!(elf.len() as u64, EHDR_SIZE + PHDR_SIZE);
+
+    // --- Program header 2: the .bss page. Read + write, never executable. ---
+    //
+    // This is the segment that earns this whole hand-encoded file its
+    // keep: `p_filesz` is zero while `p_memsz` is a full page, so the
+    // loader has to map a page that has no file content behind it *and*
+    // zero-fill it. A linker-produced ELF does not reach that branch -
+    // lld extends p_filesz to cover trailing NOBITS sections, so the
+    // zeroes come from the file (see the note in
+    // userland/hello/linker.ld). Without this file, the loader's
+    // zero-fill path would be untested, and an untested zero-fill is an
+    // information leak: whatever the frame allocator handed over last
+    // would be visible to the program.
+    elf.extend_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    elf.extend_from_slice(&6u32.to_le_bytes()); // PF_R | PF_W
+    elf.extend_from_slice(&payload_offset.to_le_bytes()); // unused: p_filesz is 0
+    elf.extend_from_slice(&(LOAD_VADDR + BSS_OFFSET).to_le_bytes());
+    elf.extend_from_slice(&(LOAD_VADDR + BSS_OFFSET).to_le_bytes());
+    elf.extend_from_slice(&0u64.to_le_bytes()); // p_filesz: nothing in the file
+    elf.extend_from_slice(&0x1000u64.to_le_bytes()); // p_memsz: one zero-filled page
+    elf.extend_from_slice(&0x1000u64.to_le_bytes());
+
+    assert_eq!(elf.len() as u64, EHDR_SIZE + PHDR_SIZE * PHDR_COUNT);
 
     elf.extend_from_slice(&payload);
     elf

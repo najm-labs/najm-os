@@ -59,6 +59,14 @@ const USER_CODE_ADDR: u64 = crate::mm::layout::USERMODE_TEST_CODE;
 /// Same reasoning, for the one-page user stack.
 const USER_STACK_ADDR: u64 = crate::mm::layout::USERMODE_TEST_STACK;
 
+/// The page `run_nx_test` marks non-executable and then jumps into.
+/// Placed one page above the main test payload so the two tests cannot
+/// affect each other's mappings.
+const NX_TEST_DATA: u64 = USER_CODE_ADDR + 0x1000;
+
+/// The stack `run_nx_test` gives its (never-executed) payload.
+const NX_TEST_STACK: u64 = USER_STACK_ADDR + 0x1000;
+
 /// Hand-assembled machine code, not compiled from a Rust function -
 /// deliberately. Extracting the exact byte range of an arbitrary
 /// Rust-compiled function to copy onto a separate page is fragile (Rust
@@ -94,14 +102,39 @@ static USERMODE_TEST_PAYLOAD: [u8; 10] =
 /// payload's final `hlt` being refused at Ring 3 is the entire point of
 /// this test, so a clean exit would mean the privilege check silently
 /// stopped working.
-pub fn run_test(
+pub fn run_test() -> ProgramExit {
+    // Mapping happens inside the page-table lock; the Ring 3 transition
+    // happens outside it, because the payload's first instruction is a
+    // syscall and the handler will need that lock itself.
+    crate::mm::memory::with_memory(map_test_pages);
+
+    serial_println!(
+        "Najm Kernel: entering Ring 3 - expect a syscall confirmation, then a General \
+         Protection Fault (the payload's `hlt` being correctly refused *is* the proof this works)"
+    );
+
+    // Safety: `USER_CODE_ADDR` was mapped read-execute and
+    // user-accessible by `map_test_pages` and now holds the payload
+    // bytes; the stack top sits above the equally-mapped stack page.
+    unsafe { run_program(USER_CODE_ADDR, USER_STACK_ADDR + Page::<Size4KiB>::SIZE) }
+}
+
+fn map_test_pages(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> ProgramExit {
+) {
     let code_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(USER_CODE_ADDR));
     let stack_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(USER_STACK_ADDR));
 
-    let user_flags =
+    let nx_available = super::cpu::detect().nx;
+
+    // Both pages start writable so the payload can be written into one of
+    // them, and the code page is tightened to read-execute immediately
+    // afterwards. That two-step exists because CR0.WP is now set: with
+    // write protection on, Ring 0 cannot write to a read-only page
+    // either, so a code page mapped read-execute up front would be
+    // unwritable at exactly the moment the payload needs to go into it.
+    let writable_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     for page in [code_page, stack_page] {
@@ -116,38 +149,139 @@ pub fn run_test(
         // owns, distinct from the kernel heap and every task stack.
         unsafe {
             mapper
-                .map_to(page, frame, user_flags, frame_allocator)
+                .map_to(page, frame, writable_flags, frame_allocator)
                 .expect("failed to map a usermode test page")
                 .flush();
         }
     }
 
     // Safety: the page containing `USER_CODE_ADDR` was just mapped
-    // PRESENT | WRITABLE immediately above, so writing the payload's 3
+    // PRESENT | WRITABLE immediately above, so writing the payload's
     // bytes into it is an in-bounds write to memory nothing else
-    // references yet. No explicit NO_EXECUTE flag was set on this page
-    // (or anywhere else in this kernel so far), so it's executable by
-    // default - correct here, but worth remembering once this kernel
-    // starts caring about W^X enforcement for real memory regions.
-    unsafe {
+    // references yet. The `with_user_access` bracket is required once
+    // SMAP is enabled and is a plain call otherwise.
+    super::cpu::with_user_access(|| unsafe {
         core::ptr::copy_nonoverlapping(
             USERMODE_TEST_PAYLOAD.as_ptr(),
             USER_CODE_ADDR as *mut u8,
             USERMODE_TEST_PAYLOAD.len(),
         );
+    });
+
+    // Now that the payload is in place, drop write permission from the
+    // code page and execute permission from the stack page. W^X applies
+    // to this hand-written test exactly as it applies to a real program -
+    // if it did not, this test would be proving Ring 3 works under
+    // conditions no real program ever runs under.
+    let code_flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+    let mut stack_flags = writable_flags;
+    if nx_available {
+        stack_flags |= PageTableFlags::NO_EXECUTE;
     }
 
-    let user_stack_top = USER_STACK_ADDR + Page::<Size4KiB>::SIZE;
+    // Safety: both pages were mapped by the loop above and remain mapped;
+    // `update_flags` changes only permission bits on an existing mapping.
+    unsafe {
+        mapper
+            .update_flags(code_page, code_flags)
+            .expect("failed to re-protect the usermode test code page")
+            .flush();
+        mapper
+            .update_flags(stack_page, stack_flags)
+            .expect("failed to re-protect the usermode test stack page")
+            .flush();
+    }
+}
+
+/// Proves the `NO_EXECUTE` bit is genuinely enforced by the CPU, by
+/// jumping into a page marked non-executable and requiring a fault.
+///
+/// This test exists because W^X is otherwise entirely unfalsifiable from
+/// inside the kernel. The loader can set `NO_EXECUTE` on every data page,
+/// the boot log can report it, `update_flags` can succeed - and if
+/// `EFER.NXE` were never enabled, all of that would still happen and the
+/// bit would mean nothing. Every stack in the system would be executable
+/// and no test would notice. The only evidence that carries any weight is
+/// an execution attempt that *fails*.
+///
+/// The payload is a single `ret` (0xC3) - deliberately the most harmless
+/// instruction available, because if NX is somehow not enforced this code
+/// does execute, and it should then do nothing dangerous rather than fall
+/// through into whatever the rest of the page contains. Its stack is set
+/// up so that `ret` would return into a `hlt`, producing a general
+/// protection fault instead of a runaway - so even the failure mode of
+/// the failure mode is contained.
+///
+/// Returns `None` when the CPU has no NX support, which is the honest
+/// answer: on such a machine the property being tested does not exist,
+/// and reporting a pass would be a lie.
+pub fn run_nx_test() -> Option<ProgramExit> {
+    if !super::cpu::detect().nx {
+        return None;
+    }
+
+    crate::mm::memory::with_memory(map_nx_test_pages);
 
     serial_println!(
-        "Najm Kernel: entering Ring 3 - expect a syscall confirmation, then a General \
-         Protection Fault (the payload's `hlt` being correctly refused *is* the proof this works)"
+        "Najm Kernel: entering Ring 3 at a NO_EXECUTE page - a page fault here is the pass \
+         condition, because it means the CPU is enforcing the bit rather than ignoring it"
     );
 
-    // Safety: `USER_CODE_ADDR` was just mapped executable and
-    // user-accessible above and now holds the payload bytes;
-    // `user_stack_top` sits at the top of the equally-mapped stack page.
-    unsafe { run_program(USER_CODE_ADDR, user_stack_top) }
+    // Safety: `NX_TEST_DATA` is a mapped, user-accessible address and
+    // `NX_TEST_STACK + 0x1000` is the top of a mapped, user-accessible
+    // stack. The entry is deliberately *not* executable, which is the
+    // property under test; the CPU is expected to refuse the instruction
+    // fetch rather than execute anything.
+    Some(unsafe { run_program(NX_TEST_DATA, NX_TEST_STACK + 0x1000) })
+}
+
+fn map_nx_test_pages(
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    let data_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(NX_TEST_DATA));
+    let stack_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(NX_TEST_STACK));
+
+    let writable_flags =
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    for page in [data_page, stack_page] {
+        let frame = frame_allocator
+            .allocate_frame()
+            .expect("out of physical frames while mapping the NX test");
+        // Safety: same reasoning as `run_test` above - a fresh frame from
+        // the bump allocator, and a fixed address this module owns.
+        unsafe {
+            mapper
+                .map_to(page, frame, writable_flags, frame_allocator)
+                .expect("failed to map an NX test page")
+                .flush();
+        }
+    }
+
+    // A lone `ret`. See the function docs for why this instruction in
+    // particular.
+    // Safety: the page was just mapped writable; nothing else references
+    // it.
+    super::cpu::with_user_access(|| unsafe {
+        (NX_TEST_DATA as *mut u8).write(0xC3);
+        // Fill the stack page's top word with an address that faults
+        // safely if `ret` ever does execute - see the docs above.
+        ((NX_TEST_STACK + 0xFF8) as *mut u64).write(NX_TEST_DATA + 0x800);
+    });
+
+    // The whole point: mark the page non-executable, then jump to it.
+    // Safety: the page is mapped and stays mapped; only permission bits
+    // change.
+    unsafe {
+        mapper
+            .update_flags(
+                data_page,
+                writable_flags | PageTableFlags::NO_EXECUTE,
+            )
+            .expect("failed to mark the NX test page non-executable")
+            .flush();
+    }
 }
 
 /// How a Ring 3 program's run ended.

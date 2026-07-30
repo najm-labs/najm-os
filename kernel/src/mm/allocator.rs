@@ -105,7 +105,11 @@ static ALLOCATOR: InterruptSafeHeap = InterruptSafeHeap(LockedHeap::empty());
 /// before anything anywhere in the kernel tries to use `Box`, `Vec`,
 /// `String`, or anything else backed by `alloc` - the global allocator
 /// isn't usable until this succeeds.
-pub fn init_heap(
+pub fn init_heap() -> Result<(), MapToError<Size4KiB>> {
+    crate::mm::memory::with_memory(|mapper, frame_allocator| init_heap_with(mapper, frame_allocator))
+}
+
+fn init_heap_with(
     mapper: &mut impl Mapper<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> Result<(), MapToError<Size4KiB>> {
@@ -121,7 +125,19 @@ pub fn init_heap(
         let frame = frame_allocator
             .allocate_frame()
             .ok_or(MapToError::FrameAllocationFailed)?;
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // NO_EXECUTE where the CPU supports it. The kernel heap holds
+        // task control blocks, Realm contexts, file contents read off the
+        // ramdisk, and every buffer a syscall copies in from userland -
+        // in other words, it is full of attacker-influenced bytes. An
+        // executable heap turns "get the kernel to store my data" into
+        // "get the kernel to store my code", which is exactly the step
+        // W^X exists to remove. `NO_EXECUTE` is only legal once
+        // `EFER.NXE` is set, which is why `arch::x86_64::cpu::init` runs
+        // before this function rather than after.
+        let mut flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        if crate::arch::x86_64::cpu::detect().nx {
+            flags |= PageTableFlags::NO_EXECUTE;
+        }
 
         // Safety: `frame` was just handed out by `frame_allocator`, which
         // only yields frames from bootloader-reported usable regions and

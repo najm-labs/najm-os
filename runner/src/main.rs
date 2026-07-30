@@ -36,6 +36,15 @@ fn main() {
         // falls back to software emulation (TCG), which still works, just
         // much slower.
         cmd.arg("-enable-kvm");
+        // The CPU model matters independently of the accelerator. QEMU's
+        // default `qemu64` model exposes neither SMEP nor SMAP, so the
+        // kernel's memory protections would be silently unavailable and
+        // the boot log would say so on every run - an accurate report of
+        // a needlessly weakened machine. `host` passes the real CPU's
+        // features through; `max` is the TCG equivalent.
+        cmd.arg("-cpu").arg("host");
+    } else {
+        cmd.arg("-cpu").arg("max");
     }
 
     eprintln!("Running: {cmd:?}");

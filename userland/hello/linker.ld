@@ -1,7 +1,7 @@
 /* Linker script for Najm OS userland programs.
  *
- * Two things here are load-bearing, and both exist because of what
- * kernel/src/loader.rs can and cannot do:
+ * Three things here are load-bearing, and all three exist because of what
+ * kernel/src/loader.rs does:
  *
  * 1. A FIXED LOAD ADDRESS, and therefore a non-PIE ET_EXEC binary. The
  *    loader supports neither PIE nor relocations nor dynamic linking - it
@@ -9,29 +9,37 @@
  *    absolute address below is what makes that assumption true rather
  *    than merely hoped for.
  *
- * 2. EXACTLY ONE PT_LOAD SEGMENT, declared explicitly in PHDRS. Left to
- *    its own devices the linker emits several PT_LOADs split by access
- *    permission (R, RX, RW). The loader maps each PT_LOAD's pages
- *    independently and would panic with a "page already mapped" error the
- *    moment two segments shared a page - which they easily can, since
- *    nothing forces the linker to give each one a whole page of its own.
- *    Collapsing everything into one RWX segment sidesteps that entirely,
- *    and costs nothing today because the loader maps every user page
- *    writable-and-executable regardless (see the W^X note in
- *    arch/x86_64/usermode.rs). When the loader learns per-segment
- *    permissions, this is the first thing that should change back.
+ * 2. THREE PT_LOAD SEGMENTS, SPLIT BY PERMISSION. This used to be a
+ *    single RWX segment, for a reason that was honest at the time: the
+ *    loader mapped every user page writable *and* executable regardless
+ *    of what the segment asked for, so splitting them bought nothing and
+ *    risked two segments sharing a page (which the loader could not
+ *    handle). Both halves of that reasoning are now obsolete - the loader
+ *    derives page flags from p_flags and refuses any segment that asks
+ *    for write and execute together. A single RWX segment would now be
+ *    rejected at load time, which is the correct outcome: it described a
+ *    program whose code was writable and whose data was executable.
+ *
+ * 3. PAGE ALIGNMENT BETWEEN SEGMENTS. Permissions are a property of a
+ *    page, not of a byte range, so two segments sharing a page cannot
+ *    have different permissions - one would silently inherit the other's.
+ *    The `. = ALIGN(4096)` lines below are what stop that, and the loader
+ *    asserts on any overlap rather than trusting this file to be right.
+ *    The cost is up to 4 KiB of padding per boundary, which is the
+ *    correct thing to spend to make W^X real.
  *
  * The address itself (0x400000) is the conventional x86_64 ET_EXEC load
  * address, and is deliberately distinct from every other fixed range this
- * system uses - the kernel heap, both usermode test payloads, and the
- * user stack the loader maps. See the address-map table in CLAUDE.md.
+ * system uses. See abi/src/layout.rs for the whole map.
  */
 
 ENTRY(_start)
 
 PHDRS
 {
-    program PT_LOAD FLAGS(7); /* PF_R | PF_W | PF_X */
+    text   PT_LOAD FLAGS(5); /* PF_R | PF_X - code, never writable */
+    rodata PT_LOAD FLAGS(4); /* PF_R        - constants, neither writable nor executable */
+    data   PT_LOAD FLAGS(6); /* PF_R | PF_W - mutable state, never executable */
 }
 
 SECTIONS
@@ -41,15 +49,19 @@ SECTIONS
     .text : {
         *(.text.start)
         *(.text .text.*)
-    } :program
+    } :text
+
+    . = ALIGN(4096);
 
     .rodata : {
         *(.rodata .rodata.*)
-    } :program
+    } :rodata
+
+    . = ALIGN(4096);
 
     .data : {
         *(.data .data.*)
-    } :program
+    } :data
 
     /* Note, verified rather than assumed: this does NOT end up
      * exercising loader.rs's `p_memsz > p_filesz` zero-fill path, even
@@ -66,7 +78,7 @@ SECTIONS
     .bss : {
         *(.bss .bss.*)
         *(COMMON)
-    } :program
+    } :data
 
     /* Metadata that would otherwise land in its own non-PT_LOAD segments
      * or bloat the image. None of it means anything without a dynamic

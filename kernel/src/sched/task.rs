@@ -34,38 +34,30 @@
 //! explaining exactly what invariant makes it sound, and is worth reading
 //! closely rather than trusting on faith.
 
+use crate::mm::kstack::{self, KernelStack};
 use crate::serial_println;
-use alloc::alloc::{alloc, dealloc, Layout};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use core::arch::naked_asm;
 use spin::Mutex;
 
-/// 16 KiB per task. The original value here was 64 KiB - generous "just
-/// in case," and exactly the kind of unexamined margin that broke the
-/// very first run of this scheduler: two tasks at 64 KiB each demanded
-/// 128 KiB against a 100 KiB heap, and `alloc` correctly returned null
-/// rather than silently misbehaving. 16 KiB is still comfortable for
-/// these simple, non-recursive test tasks - real headroom, not a
-/// hand-wave - but it's a number now chosen against the heap's actual
-/// size (see `allocator::HEAP_SIZE`) instead of independently of it.
-/// There is still no stack overflow detection for task stacks (unlike
-/// the kernel's own double-fault stack, which has the IST mechanism from
-/// gdt.rs) - a task that recurses too deeply corrupts whatever memory
-/// sits past the end of its stack rather than faulting cleanly. Worth
-/// solving with a guard page once per-task page tables exist; not
-/// solvable cheaply before then.
-const STACK_SIZE: usize = 4096 * 4;
-
-/// The x86_64 System V ABI requires the stack pointer to be 16-byte
-/// aligned at the point of a `call` instruction. Getting this wrong
-/// doesn't fail to compile or even fail immediately - it silently
-/// corrupts SSE/aligned-move operations deep inside whatever code
-/// happens to assume it, which is a much worse failure mode than a
-/// crash. `Vec<u8>` does not guarantee this alignment, which is exactly
-/// why this module allocates task stacks manually via `alloc::alloc`
-/// with an explicit `Layout` instead of using a `Vec`.
-const STACK_ALIGN: usize = 16;
+// Task stack size, alignment and lifetime now live in `mm::kstack`
+// (`layout::KERNEL_STACK_SIZE`), not here.
+//
+// They used to be `alloc::alloc` allocations from the kernel heap with an
+// explicit 16-byte `Layout`, which had two problems this module could not
+// fix on its own. Stacks competed with every other kernel allocation for
+// a fixed-size heap - the very first run of this scheduler failed because
+// two 64 KiB stacks did not fit in a 100 KiB heap. And, more seriously, a
+// heap allocation cannot have a **guard page**: the memory below it
+// belongs to the allocator and is probably another live allocation, so a
+// task that recursed one frame too deep silently corrupted something else
+// instead of faulting.
+//
+// `mm::kstack` gives each stack its own virtual slot with an unmapped
+// page beneath it, so overflow is a page fault at a known address. The
+// 16-byte ABI alignment comes free from the slot base and size both being
+// multiples of 4096.
 
 /// The RFLAGS value a brand new task starts with.
 ///
@@ -88,17 +80,18 @@ pub struct Task {
     /// running, this field is stale (it holds wherever RSP was the last
     /// time this task was switched *away* from).
     stack_pointer: u64,
-    stack_base: *mut u8,
-    stack_layout: Layout,
+    /// The stack this task owns, with its guard page. Returned to
+    /// `mm::kstack` in `Drop`.
+    stack: KernelStack,
 }
 
-// Safety: `stack_base` is exclusively owned by this `Task` (allocated in
-// `Task::new`, freed in `Drop`, never aliased elsewhere) and there is no
-// actual concurrent hardware access to guard against yet - this kernel is
-// single-core so far. This impl exists because `Mutex<Scheduler>` needs
-// `Scheduler: Send` to be usable in a `static`, and the compiler can't
-// infer on its own that a raw pointer is safe to hand across that
-// boundary - only a human reasoning about the actual ownership can.
+// Safety: the `KernelStack` slot is exclusively owned by this `Task`
+// (claimed in `Task::new`, released in `Drop`, never aliased elsewhere -
+// `Task` has no `Clone`), and this kernel is single-core so there is no
+// concurrent hardware access to guard against yet. This impl exists
+// because `Mutex<Scheduler>` needs `Scheduler: Send` to be usable in a
+// `static`, and the compiler cannot infer on its own that this ownership
+// pattern is safe to hand across that boundary.
 unsafe impl Send for Task {}
 
 impl Task {
@@ -109,17 +102,12 @@ impl Task {
     /// because `context_switch`'s `ret` is the *only* thing that ever
     /// reads it.
     pub fn new(entry: extern "C" fn() -> !) -> Task {
-        let stack_layout =
-            Layout::from_size_align(STACK_SIZE, STACK_ALIGN).expect("invalid task stack layout");
+        let stack = crate::mm::memory::with_memory(|mapper, frame_allocator| {
+            kstack::allocate(mapper, frame_allocator)
+        })
+        .expect("out of kernel stack slots - raise layout::KERNEL_STACK_SLOTS");
 
-        // Safety: `stack_layout` has a non-zero size (STACK_SIZE is a
-        // fixed positive constant), which is the one precondition
-        // `alloc::alloc::alloc` has beyond a valid `Layout`.
-        let stack_base = unsafe { alloc(stack_layout) };
-        assert!(!stack_base.is_null(), "task stack allocation failed");
-
-        let stack_top = stack_base as u64 + STACK_SIZE as u64;
-        let mut rsp = stack_top;
+        let mut rsp = stack.top;
 
         // Hand-builds the exact stack layout `context_switch` expects to
         // find for a task it's resuming for the first time: a starting
@@ -157,21 +145,21 @@ impl Task {
 
         Task {
             stack_pointer: rsp,
-            stack_base,
-            stack_layout,
+            stack,
         }
     }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
-        // Safety: `stack_base`/`stack_layout` are exactly the values
-        // `alloc` returned for this task in `Task::new`, and this is the
-        // only place this allocation is ever freed - `Task` has no
-        // `Clone`, so double-free via aliasing isn't possible.
-        unsafe {
-            dealloc(self.stack_base, self.stack_layout);
-        }
+        // Returns the slot for reuse. Unlike the previous heap-based
+        // version this frees no memory - the mapping stays in place
+        // deliberately, so that a dangling pointer into a dead task's
+        // stack lands on an identifiable address rather than inside an
+        // unrelated live allocation. See `mm::kstack::release`.
+        //
+        // `Task` has no `Clone`, so a slot can never be released twice.
+        kstack::release(self.stack);
     }
 }
 
@@ -189,16 +177,12 @@ impl Task {
     /// new path can't silently reintroduce a regression in the
     /// already-working one.
     pub fn new_with_context(entry: extern "C" fn(*mut u8) -> !, context: *mut u8) -> Task {
-        let stack_layout = Layout::from_size_align(STACK_SIZE, STACK_ALIGN)
-            .expect("invalid task stack layout");
+        let stack = crate::mm::memory::with_memory(|mapper, frame_allocator| {
+            kstack::allocate(mapper, frame_allocator)
+        })
+        .expect("out of kernel stack slots - raise layout::KERNEL_STACK_SLOTS");
 
-        // Safety: same reasoning as `Task::new` - `stack_layout` has a
-        // fixed, non-zero size.
-        let stack_base = unsafe { alloc(stack_layout) };
-        assert!(!stack_base.is_null(), "task stack allocation failed");
-
-        let stack_top = stack_base as u64 + STACK_SIZE as u64;
-        let mut rsp = stack_top;
+        let mut rsp = stack.top;
 
         // Same fabricated-frame technique as `Task::new`, with two
         // differences: the "return address" points at `task_trampoline`
@@ -244,8 +228,7 @@ impl Task {
 
         Task {
             stack_pointer: rsp,
-            stack_base,
-            stack_layout,
+            stack,
         }
     }
 }
@@ -406,11 +389,14 @@ static SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 /// That applies to every acquisition of this lock outside an interrupt
 /// handler, which is why they all look like this.
 pub fn spawn(entry: extern "C" fn() -> !) {
+    // The `Task` is built *before* the scheduler lock is taken, not
+    // inside it. Constructing one now maps a kernel stack, which takes
+    // the page-table lock - and holding two kernel locks at once is how a
+    // lock-order inversion gets introduced. Building first means only one
+    // lock is ever held at a time on this path.
+    let task = Box::new(Task::new(entry));
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER
-            .lock()
-            .ready_queue
-            .push_back(Box::new(Task::new(entry)));
+        SCHEDULER.lock().ready_queue.push_back(task);
     });
 }
 
@@ -418,11 +404,10 @@ pub fn spawn(entry: extern "C" fn() -> !) {
 /// `Task::new_with_context` to the ready queue. See that function, and
 /// `realm.rs`, for what "context" is for.
 pub fn spawn_with_context(entry: extern "C" fn(*mut u8) -> !, context: *mut u8) {
+    // Built before the lock is taken - see `spawn` for why.
+    let task = Box::new(Task::new_with_context(entry, context));
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER
-            .lock()
-            .ready_queue
-            .push_back(Box::new(Task::new_with_context(entry, context)));
+        SCHEDULER.lock().ready_queue.push_back(task);
     });
 }
 

@@ -5,5 +5,6 @@
 //! to anyone who's read kernel source before.
 
 pub mod allocator;
+pub mod kstack;
 pub mod layout;
 pub mod memory;

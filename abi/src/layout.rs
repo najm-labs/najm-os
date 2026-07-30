@@ -152,6 +152,39 @@ pub const USER_STACK_GUARD: u64 = USER_STACK_BOTTOM - 4096;
 /// is an enormous gap between the two.
 pub const KERNEL_HEAP_START: u64 = 0xffff_c000_0000_0000;
 
+/// Base of the region kernel task stacks are carved out of.
+///
+/// Task stacks used to come from the kernel heap via `alloc::alloc`,
+/// which had two problems. The smaller one is that they competed with
+/// every other kernel allocation for a fixed-size heap - the very first
+/// run of the scheduler failed because two 64 KiB stacks did not fit in a
+/// 100 KiB heap. The larger one is that a heap allocation cannot have a
+/// **guard page**: the page below it belongs to the allocator, so a task
+/// that overflows its stack quietly corrupts another allocation instead
+/// of faulting. Kernel stack overflow is exactly the failure that most
+/// deserves to be loud, because the corruption it causes surfaces
+/// somewhere else entirely.
+///
+/// Giving stacks their own virtual region fixes both: each slot is a
+/// mapped stack plus one deliberately unmapped page below it, and no
+/// amount of heap pressure can take a stack away.
+pub const KERNEL_STACK_AREA: u64 = 0xffff_d000_0000_0000;
+
+/// Usable bytes per kernel task stack (16 KiB).
+pub const KERNEL_STACK_SIZE: u64 = 16 * 1024;
+
+/// Virtual bytes reserved per stack: the stack itself plus one unmapped
+/// guard page below it. Address space is free; a guard page costs nothing
+/// but a page-table entry that stays absent.
+pub const KERNEL_STACK_SLOT: u64 = KERNEL_STACK_SIZE + 4096;
+
+/// How many kernel stacks the region can hold before it runs out.
+///
+/// A cap rather than an unbounded region, so that a runaway spawn loop
+/// fails with a clear message at a known limit instead of growing until
+/// it collides with whatever is mapped next.
+pub const KERNEL_STACK_SLOTS: u64 = 256;
+
 /// 16 MiB.
 ///
 /// Was 1 MiB, sized when the only heap users were `Vec`/`Box` bookkeeping

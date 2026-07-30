@@ -155,24 +155,25 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             ),
     );
 
-    // Safety: this is the only place `memory::init` is ever called, and
+    // CPU protections first, and specifically before anything maps a
+    // page: `NO_EXECUTE` is bit 63 of a page table entry and is a
+    // *reserved bit violation* unless `EFER.NXE` is enabled, so a heap
+    // mapped with NX before this ran would fault on first touch. See
+    // `arch::x86_64::cpu` for what each protection actually prevents.
+    let cpu_features = arch::x86_64::cpu::init();
+
+    // Safety: this is the only place `memory::init` is ever called;
     // `physical_memory_offset` is exactly the value the bootloader just
-    // reported above - not guessed, computed, or reused.
-    let mut mapper = unsafe { mm::memory::init(physical_memory_offset) };
+    // reported above, and `memory_regions` is the bootloader's own memory
+    // map - neither is guessed, computed, or reused.
+    unsafe { mm::memory::init(physical_memory_offset, &boot_info.memory_regions) };
 
     serial_println!(
         "Najm Kernel: physical memory mapped at {:#x} (higher half starts at {:#x})",
         physical_memory_offset.as_u64(),
         mm::layout::HIGHER_HALF_START
     );
-    // Safety: `boot_info.memory_regions` comes directly from the
-    // bootloader's own memory probing during boot - trusted here for the
-    // same reason the rest of BootInfo already is.
-    let mut frame_allocator =
-        unsafe { mm::memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
-
-    mm::allocator::init_heap(&mut mapper, &mut frame_allocator)
-        .expect("heap initialization failed");
+    mm::allocator::init_heap().expect("heap initialization failed");
     serial_println!(
         "Najm Kernel: heap mapped and initialized ({} KiB at {:#x})",
         mm::allocator::HEAP_SIZE / 1024,
@@ -227,6 +228,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             "{} lower-half PML4 entries in use (must be 0 - the lower half belongs to user \
              processes), {} higher-half entries (the kernel)",
             lower_half_entries, higher_half_entries
+        ),
+    );
+
+    // NX is the load-bearing one: without it, `NO_EXECUTE` cannot even be
+    // *expressed* in a page table entry (setting bit 63 becomes a
+    // reserved-bit violation), so W^X would be unimplementable rather
+    // than merely unimplemented. SMEP/SMAP/UMIP are reported but not
+    // required - they depend on the CPU model, and QEMU's default
+    // `qemu64` exposes none of them, so failing the boot over their
+    // absence would make the test suite unrunnable on a default QEMU.
+    selftest::check(
+        "NX support",
+        cpu_features.nx,
+        format_args!(
+            "execute-disable is {} - SMEP {}, SMAP {}, UMIP {}",
+            if cpu_features.nx { "enabled" } else { "MISSING" },
+            cpu_features.smep,
+            cpu_features.smap,
+            cpu_features.umip
+        ),
+    );
+
+    // A guard page is protective only because nothing maps it, and that
+    // guarantee is exactly the kind that dies silently. Walking the page
+    // tables to confirm the page below a real, live kernel stack is
+    // absent costs one translation and makes the protection falsifiable.
+    let guard_check = mm::memory::with_memory(|mapper, frame_allocator| {
+        let stack = mm::kstack::allocate(mapper, frame_allocator)
+            .expect("could not allocate a kernel stack for the guard page test");
+        let unmapped = mm::kstack::guard_page_is_unmapped(&stack, mapper);
+        let guard = stack.guard_page();
+        mm::kstack::release(stack);
+        (unmapped, guard)
+    });
+    selftest::check(
+        "kernel stack guard page",
+        guard_check.0,
+        format_args!(
+            "the page below a kernel stack ({:#x}) is unmapped, so overflow faults instead of \
+             corrupting the next allocation",
+            guard_check.1
         ),
     );
 
@@ -383,12 +425,29 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // address, no ELF parsing involved), so if the Ring 3 machinery
     // itself has regressed, this isolates that from anything the ELF
     // loader might be doing wrong.
-    let usermode_exit = arch::x86_64::usermode::run_test(&mut mapper, &mut frame_allocator);
+    let usermode_exit = arch::x86_64::usermode::run_test();
     report_program_exit(
         "hand-written Ring 3 payload",
         usermode_exit,
         arch::x86_64::usermode::ProgramExit::GeneralProtectionFault,
     );
+
+    // The one test that can actually falsify W^X. Everything else about
+    // it - the loader setting NO_EXECUTE, the heap setting NO_EXECUTE,
+    // the boot log reporting NX as enabled - would look identical on a
+    // kernel where `EFER.NXE` was never set and the bit meant nothing.
+    // Only an execution attempt that *fails* is evidence.
+    match arch::x86_64::usermode::run_nx_test() {
+        Some(exit) => report_program_exit(
+            "NO_EXECUTE enforcement",
+            exit,
+            arch::x86_64::usermode::ProgramExit::PageFault,
+        ),
+        None => serial_println!(
+            "Najm Kernel: skipping the NO_EXECUTE test - this CPU does not support NX, so \
+             there is no property here to test (reporting a pass would be a lie)"
+        ),
+    }
 
     let ramdisk_addr = boot_info
         .ramdisk_addr
@@ -410,7 +469,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ramdisk_len
     );
 
-    let exit = loader::load_and_run(ramdisk, &mut mapper, &mut frame_allocator);
+    let exit = loader::load_and_run(ramdisk);
     // Status 7 is what `userland/hello`'s `_start` passes to `exit`. If
     // the ramdisk is instead the hand-encoded fallback from
     // runner/build.rs (built when USERLAND_PATH isn't set), that one
@@ -490,10 +549,15 @@ fn epilogue() -> ! {
     );
 
     let (heap_used, heap_free) = mm::allocator::heap_stats();
+    let (stacks_live, stacks_ever, stack_capacity) = mm::kstack::stats();
     serial_println!(
-        "Najm Kernel: heap at end of boot - {} KiB used, {} KiB free",
+        "Najm Kernel: heap at end of boot - {} KiB used, {} KiB free; kernel stacks - {} live, \
+         {} slots ever used of {}",
         heap_used / 1024,
-        heap_free / 1024
+        heap_free / 1024,
+        stacks_live,
+        stacks_ever,
+        stack_capacity
     );
 
     let all_passed = selftest::report();

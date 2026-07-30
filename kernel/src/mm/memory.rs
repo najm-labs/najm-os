@@ -10,6 +10,7 @@
 
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
 use x86_64::{
     structures::paging::{
         page_table::PageTableFlags, FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB,
@@ -50,20 +51,83 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     &mut *page_table_ptr
 }
 
-/// Builds an `OffsetPageTable` capable of translating virtual addresses
-/// and creating new mappings, using the bootloader's physical-memory
-/// mapping to reach arbitrary physical frames - including page tables
-/// that aren't mapped anywhere else yet, which is exactly what's needed
-/// to map new heap pages in `allocator::init_heap`.
+/// The kernel's page table mapper and physical frame allocator.
+///
+/// These used to be locals in `kernel_main`, threaded through every
+/// function that needed them as `&mut` parameters. That was the right
+/// first shape - it made the single-owner property obvious and cost
+/// nothing while the only callers were `init_heap`, the ELF loader, and
+/// one usermode test, all reached directly from `kernel_main`.
+///
+/// It stops working the moment memory has to be mapped from somewhere
+/// that is not on `kernel_main`'s call stack: a task spawning and needing
+/// a kernel stack, a syscall handler servicing `mmap`, a process exiting
+/// and needing its address space torn down. None of those can be handed a
+/// reference by a caller that is not in the picture.
+///
+/// So they become globals, with the ownership discipline moved from the
+/// type system into one accessor ([`with_memory`]) that is the only way
+/// to reach them. That is a real loss of static checking, stated plainly
+/// rather than glossed: the compiler used to prove there was one `&mut`,
+/// and now a lock does. The mitigation is that the lock is not reentrant
+/// and `with_memory` disables interrupts, so the failure mode of getting
+/// it wrong is an immediate deadlock rather than aliasing corruption -
+/// loud, and at the exact call site.
+static MEMORY: Mutex<Option<(OffsetPageTable<'static>, BootInfoFrameAllocator)>> = Mutex::new(None);
+
+/// Sets up page table access and the frame allocator.
 ///
 /// # Safety
-/// Same requirement as `active_level_4_table`: `physical_memory_offset`
-/// must be exactly correct, and this must only be called once.
-pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+/// `physical_memory_offset` must be exactly what the bootloader reported
+/// (see `BOOTLOADER_CONFIG` in main.rs, which requests this mapping in
+/// the first place), `memory_regions` must be the bootloader's own memory
+/// map, and this must be called exactly once. Calling it twice would
+/// produce two live `&'static mut` references to the same page table,
+/// which is undefined behaviour regardless of what is done with them.
+pub unsafe fn init(physical_memory_offset: VirtAddr, memory_regions: &'static MemoryRegions) {
     PHYSICAL_MEMORY_OFFSET.store(physical_memory_offset.as_u64(), Ordering::SeqCst);
 
-    let level_4_table = active_level_4_table(physical_memory_offset);
-    OffsetPageTable::new(level_4_table, physical_memory_offset)
+    // Safety: forwarded from this function's contract.
+    let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
+    let mapper = OffsetPageTable::new(level_4_table, physical_memory_offset);
+
+    // Safety: forwarded - `memory_regions` comes straight from the
+    // bootloader's own probing, the same trust boundary the rest of early
+    // boot already depends on.
+    let frame_allocator = unsafe { BootInfoFrameAllocator::init(memory_regions) };
+
+    let mut memory = MEMORY.lock();
+    assert!(
+        memory.is_none(),
+        "mm::memory::init called twice - that would alias the active page table"
+    );
+    *memory = Some((mapper, frame_allocator));
+}
+
+/// Runs `f` with exclusive access to the page tables and frame allocator.
+///
+/// **Never call this from inside itself.** The lock is a non-reentrant
+/// spin lock, so a nested call deadlocks with interrupts disabled, which
+/// is an unrecoverable hang. Functions that need to map memory and are
+/// themselves called from inside a `with_memory` block should take
+/// `mapper` and `frame_allocator` as parameters instead - that is why
+/// `mm::kstack::allocate` and `loader::load` are written that way rather
+/// than reaching for the globals themselves.
+///
+/// Interrupts are disabled for the duration, for the reason every lock in
+/// this kernel disables them: a timer tick landing inside the critical
+/// section can switch to a task that takes the same lock, against a
+/// holder that can never be scheduled again.
+pub fn with_memory<T>(
+    f: impl FnOnce(&mut OffsetPageTable<'static>, &mut BootInfoFrameAllocator) -> T,
+) -> T {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut guard = MEMORY.lock();
+        let (mapper, frame_allocator) = guard
+            .as_mut()
+            .expect("mm::memory::with_memory called before mm::memory::init");
+        f(mapper, frame_allocator)
+    })
 }
 
 /// Whether every byte of `start..start + len` is mapped *and* marked
@@ -269,10 +333,20 @@ pub fn copy_from_user(ptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
     // capacity for exactly `len` bytes and the two regions cannot overlap
     // (one is user memory in the lower half, the other a kernel heap
     // allocation in the higher half).
-    unsafe {
+    // Safety: `user_range_is_accessible` has just confirmed every page of
+    // `ptr..ptr + len` is present and user-accessible in the active page
+    // tables, so the read is in-bounds and cannot fault. `buffer` has
+    // capacity for exactly `len` bytes and the two regions cannot overlap
+    // (one is user memory in the lower half, the other a kernel heap
+    // allocation in the higher half). The `with_user_access` bracket is
+    // what makes this legal at all when SMAP is enabled - see
+    // `arch::x86_64::cpu::with_user_access`; it contains the copy and
+    // nothing else, so the window in which the kernel may touch user
+    // memory is as narrow as it can be.
+    crate::arch::x86_64::cpu::with_user_access(|| unsafe {
         core::ptr::copy_nonoverlapping(ptr as *const u8, buffer.as_mut_ptr(), len);
         buffer.set_len(len);
-    }
+    });
 
     Some(buffer)
 }
@@ -295,9 +369,11 @@ pub fn copy_to_user(ptr: u64, bytes: &[u8]) -> Option<usize> {
     // the destination is present, user-accessible and writable. The
     // source is a kernel slice, and kernel and user memory are in
     // different halves of the address space, so they cannot overlap.
-    unsafe {
+    // Bracketed by `with_user_access` for the same reason as
+    // `copy_from_user` above.
+    crate::arch::x86_64::cpu::with_user_access(|| unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
-    }
+    });
 
     Some(bytes.len())
 }

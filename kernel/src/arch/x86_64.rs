@@ -12,6 +12,7 @@
 //! resolves a bare `use x86_64::...` against the extern prelude first,
 //! not against sibling or ancestor module names.
 
+pub mod cpu;
 pub mod gdt;
 pub mod interrupts;
 pub mod usermode;

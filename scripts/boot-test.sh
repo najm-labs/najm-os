@@ -71,9 +71,18 @@ fi
 # KVM is a large speedup but is not available everywhere (nested virt, CI
 # containers, /dev/kvm permissions). Detect rather than require: a boot
 # test that cannot run at all is worse than a slow one.
+#
+# The CPU model matters as much as the accelerator here. QEMU's default
+# `qemu64` model exposes neither SMEP nor SMAP, so a kernel that enables
+# them correctly and a kernel that does not would produce identical logs
+# under it - the security self-tests would be vacuously satisfied. `-cpu
+# host` (KVM) and `-cpu max` (TCG) both expose the full feature set, which
+# is what makes those checks mean anything.
 ACCEL=()
 if [ -r /dev/kvm ] && [ -w /dev/kvm ] && [ "${NO_KVM:-0}" != "1" ]; then
-    ACCEL=(-enable-kvm)
+    ACCEL=(-enable-kvm -cpu host)
+else
+    ACCEL=(-cpu max)
 fi
 
 echo "==> booting (image: $IMAGE, log: $LOG)"
