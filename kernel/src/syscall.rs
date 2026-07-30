@@ -114,6 +114,12 @@ pub extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64, rsp_at_
         sys::STAT => sys_stat(arg1, arg2, arg3),
         sys::READDIR => sys_readdir(arg1, arg2, arg3),
 
+        sys::SURFACE_CREATE => sys_surface_create(arg1, arg2),
+        sys::SURFACE_COMMIT => sys_surface_commit(arg1, arg2, arg3),
+        sys::SURFACE_INFO => sys_surface_info(arg1, arg2),
+        sys::INPUT_POLL => sys_input_poll(arg1, arg2),
+        sys::REALM_INFO => sys_realm_info(arg1),
+
         unknown => {
             serial_println!(
                 "Najm Kernel: unknown syscall number {:#x} (args {:#x}, {:#x}, {:#x})",
@@ -464,6 +470,195 @@ fn sys_readdir(descriptor: u64, buf_ptr: u64, buf_len: u64) -> u64 {
 
     match crate::mm::memory::copy_to_user(buf_ptr, &out) {
         Some(written) => written as u64,
+        None => encode_error(err::EFAULT),
+    }
+}
+
+/// `surface_create(width, height) -> surface_id`
+///
+/// The Realm decides the mode, not the caller. A Gaming Realm gets
+/// exclusive fullscreen because that is what its scheduling class and
+/// capability set are for; everything else gets a window. Letting the
+/// *program* choose would make "exclusive fullscreen" something any
+/// application could request, which is the same failure as letting one
+/// request its own Realm - see ARCHITECTURE.md 2e.
+///
+/// Note that fullscreen still excludes the trusted-path strip. That is
+/// threat 4 in ARCHITECTURE.md 2d, and the answer there is not "find
+/// somewhere else for the indicator" but "the strip was never available
+/// to give away".
+fn sys_surface_create(width: u64, height: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::SURFACE_CREATE) {
+        return e;
+    }
+    let Some(profile) = crate::process::current_profile() else {
+        return encode_error(err::EPERM);
+    };
+    let pid = crate::sched::task::current_pid();
+
+    let mode = if profile.allows(najm_abi::capability_bits::EXCLUSIVE_SCANOUT) {
+        crate::graphics::compositor::SurfaceMode::Fullscreen
+    } else {
+        crate::graphics::compositor::SurfaceMode::Windowed
+    };
+
+    match crate::graphics::compositor::create_surface(
+        pid,
+        profile.kind,
+        profile.name,
+        width as usize,
+        height as usize,
+        mode,
+    ) {
+        Some(id) => id,
+        None => encode_error(err::ENOMEM),
+    }
+}
+
+/// `surface_commit(surface_id, pixels_ptr, len)`
+///
+/// `len` is in bytes and must exactly match the surface's size. See
+/// `compositor::commit_surface` for why exactness rather than a
+/// short-buffer allowance: a partial commit would leave the rest of the
+/// frame holding whatever was in that buffer before, and surface buffers
+/// are reused between processes.
+fn sys_surface_commit(id: u64, pixels_ptr: u64, len: u64) -> u64 {
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return encode_error(err::EPERM);
+    }
+
+    let Some((width, height)) = crate::graphics::compositor::surface_geometry(id, pid) else {
+        // Covers both "no such surface" and "not yours" without
+        // distinguishing them, which is deliberate: telling a caller that
+        // a surface exists but belongs to someone else is an oracle for
+        // enumerating other processes' surfaces.
+        return encode_error(err::EBADF);
+    };
+
+    let expected = width * height * 4;
+    if len as usize != expected {
+        return encode_error(err::EINVAL);
+    }
+
+    // Copied straight into the surface buffer rather than through
+    // `copy_from_user`, which caps at 1 MiB because it allocates a buffer
+    // sized by a caller-chosen length. A frame is legitimately megabytes
+    // and its size was bounded when the surface was created, so the cap
+    // would be protecting against the wrong thing here - and raising it
+    // globally would remove the protection where it is needed.
+    if !crate::graphics::compositor::commit_surface_from_user(id, pid, pixels_ptr, expected) {
+        return encode_error(err::EFAULT);
+    }
+
+    crate::graphics::compositor::present_throttled();
+    0
+}
+
+/// `surface_info(surface_id, out_ptr)` - writes a `SurfaceInfo`.
+fn sys_surface_info(id: u64, out_ptr: u64) -> u64 {
+    let pid = crate::sched::task::current_pid();
+    let Some((width, height)) = crate::graphics::compositor::surface_geometry(id, pid) else {
+        return encode_error(err::EBADF);
+    };
+
+    let info = najm_abi::SurfaceInfo {
+        width: width as u64,
+        height: height as u64,
+        stride: (width * 4) as u64,
+        bytes_per_pixel: 4,
+    };
+
+    // Safety: `SurfaceInfo` is `#[repr(C)]` and holds only `u64`s, so it
+    // has no padding and no invalid bit patterns - every byte is
+    // initialized and meaningful, which is what makes viewing it as bytes
+    // sound. The write itself goes through `copy_to_user`, which
+    // validates the destination against the calling process's own page
+    // tables.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const najm_abi::SurfaceInfo as *const u8,
+            core::mem::size_of::<najm_abi::SurfaceInfo>(),
+        )
+    };
+
+    match crate::mm::memory::copy_to_user(out_ptr, bytes) {
+        Some(_) => 0,
+        None => encode_error(err::EFAULT),
+    }
+}
+
+/// `input_poll(out_ptr, max_events) -> events written`
+///
+/// Consumes the events it returns. That is the right semantic for an
+/// input queue - an event delivered twice is a keystroke typed twice -
+/// but it means a program that polls and then fails to copy the result
+/// has lost them. The copy therefore happens before the queue is
+/// drained... which it cannot, because the events must be read to be
+/// copied. So the events are taken first and the copy is checked: if the
+/// destination is bad, the events are gone and the caller gets EFAULT.
+/// That is a real, if minor, loss, and it is the honest trade for not
+/// keeping a shadow copy of every poll.
+fn sys_input_poll(out_ptr: u64, max_events: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::INPUT_READ) {
+        return e;
+    }
+
+    // Bounded so a caller cannot ask the kernel to allocate arbitrarily.
+    let wanted = core::cmp::min(max_events as usize, 64);
+    if wanted == 0 {
+        return 0;
+    }
+
+    let mut events = alloc::vec![najm_abi::InputEvent::default(); wanted];
+    let count = crate::drivers::input::poll(&mut events);
+    if count == 0 {
+        return 0;
+    }
+
+    // Safety: `InputEvent` is `#[repr(C)]` and holds only `u64`s - no
+    // padding, no invalid bit patterns. Same reasoning as `sys_surface_info`.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            events.as_ptr() as *const u8,
+            count * core::mem::size_of::<najm_abi::InputEvent>(),
+        )
+    };
+
+    match crate::mm::memory::copy_to_user(out_ptr, bytes) {
+        Some(_) => count as u64,
+        None => encode_error(err::EFAULT),
+    }
+}
+
+/// `realm_info(out_ptr)` - writes a `RealmInfo`.
+///
+/// A process learning what it is allowed to attempt. Note it gains
+/// nothing by lying to itself: the bitmask reported here is a *view* of
+/// the kernel-side profile, and every syscall consults the profile
+/// directly rather than anything the process holds.
+fn sys_realm_info(out_ptr: u64) -> u64 {
+    let pid = crate::sched::task::current_pid();
+    let Some(profile) = crate::process::current_profile() else {
+        return encode_error(err::EPERM);
+    };
+
+    let info = najm_abi::RealmInfo {
+        kind: profile.kind,
+        pid,
+        capabilities: profile.capabilities,
+    };
+
+    // Safety: as `sys_surface_info` - `#[repr(C)]`, all `u64`, no padding.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const najm_abi::RealmInfo as *const u8,
+            core::mem::size_of::<najm_abi::RealmInfo>(),
+        )
+    };
+
+    match crate::mm::memory::copy_to_user(out_ptr, bytes) {
+        Some(_) => 0,
         None => encode_error(err::EFAULT),
     }
 }

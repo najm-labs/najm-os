@@ -32,6 +32,11 @@ FSTEST_MANIFEST   := userland/fstest/Cargo.toml
 FSTEST_BIN_DEBUG   := $(CURDIR)/userland/fstest/target/$(KERNEL_TARGET)/debug/najm-fstest
 FSTEST_BIN_RELEASE := $(CURDIR)/userland/fstest/target/$(KERNEL_TARGET)/release/najm-fstest
 
+# The graphical program - creates a surface and draws into it.
+GUI_MANIFEST   := userland/gui/Cargo.toml
+GUI_BIN_DEBUG   := $(CURDIR)/userland/gui/target/$(KERNEL_TARGET)/debug/najm-gui
+GUI_BIN_RELEASE := $(CURDIR)/userland/gui/target/$(KERNEL_TARGET)/release/najm-gui
+
 .PHONY: build userland run run-release run-no-kvm check clean test
 
 ## The closest thing this project has to `cargo test`: build everything,
@@ -52,6 +57,7 @@ build:
 userland:
 	cargo build --manifest-path $(USERLAND_MANIFEST) --target $(KERNEL_TARGET)
 	cargo build --manifest-path $(FSTEST_MANIFEST) --target $(KERNEL_TARGET)
+	cargo build --manifest-path $(GUI_MANIFEST) --target $(KERNEL_TARGET)
 
 ## Fast type-check of the kernel, no codegen - useful while iterating.
 check:
@@ -60,7 +66,7 @@ check:
 ## Build everything (debug) and boot it in QEMU.
 run: build userland
 	KERNEL_PATH="$(KERNEL_BIN_DEBUG)" USERLAND_PATH="$(USERLAND_BIN_DEBUG)" \
-		USERLAND_FSTEST_PATH="$(FSTEST_BIN_DEBUG)" \
+		USERLAND_FSTEST_PATH="$(FSTEST_BIN_DEBUG)" USERLAND_GUI_PATH="$(GUI_BIN_DEBUG)" \
 		cargo run --manifest-path runner/Cargo.toml
 
 ## Build everything (release, optimized + LTO) and boot it in QEMU.
@@ -68,19 +74,21 @@ run-release:
 	cargo build --manifest-path kernel/Cargo.toml --target $(KERNEL_TARGET) --release
 	cargo build --manifest-path $(USERLAND_MANIFEST) --target $(KERNEL_TARGET) --release
 	cargo build --manifest-path $(FSTEST_MANIFEST) --target $(KERNEL_TARGET) --release
+	cargo build --manifest-path $(GUI_MANIFEST) --target $(KERNEL_TARGET) --release
 	KERNEL_PATH="$(KERNEL_BIN_RELEASE)" USERLAND_PATH="$(USERLAND_BIN_RELEASE)" \
-		USERLAND_FSTEST_PATH="$(FSTEST_BIN_RELEASE)" \
+		USERLAND_FSTEST_PATH="$(FSTEST_BIN_RELEASE)" USERLAND_GUI_PATH="$(GUI_BIN_RELEASE)" \
 		cargo run --manifest-path runner/Cargo.toml --release
 
 ## Boot without KVM acceleration (software emulation) - useful for
 ## comparing behavior, or if /dev/kvm isn't available.
 run-no-kvm: build userland
 	KERNEL_PATH="$(KERNEL_BIN_DEBUG)" USERLAND_PATH="$(USERLAND_BIN_DEBUG)" \
-		USERLAND_FSTEST_PATH="$(FSTEST_BIN_DEBUG)" \
+		USERLAND_FSTEST_PATH="$(FSTEST_BIN_DEBUG)" USERLAND_GUI_PATH="$(GUI_BIN_DEBUG)" \
 		cargo run --manifest-path runner/Cargo.toml -- --no-kvm
 
 clean:
 	cargo clean --manifest-path kernel/Cargo.toml
 	cargo clean --manifest-path $(USERLAND_MANIFEST)
 	cargo clean --manifest-path $(FSTEST_MANIFEST)
+	cargo clean --manifest-path $(GUI_MANIFEST)
 	cargo clean --manifest-path runner/Cargo.toml

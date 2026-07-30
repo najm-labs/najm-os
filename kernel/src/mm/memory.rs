@@ -367,6 +367,44 @@ pub fn copy_from_user(ptr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
     Some(buffer)
 }
 
+/// Copies from a user buffer into a caller-provided destination.
+///
+/// The counterpart to `copy_from_user` for transfers too large for it.
+/// `copy_from_user` caps at [`MAX_USER_TRANSFER`] because it *allocates*
+/// a buffer sized by a length the caller chose - without a cap, a program
+/// asking for a 100 GiB write would exhaust the kernel heap through an
+/// ordinary syscall. That reasoning does not apply here: the destination
+/// already exists and its size is the kernel's own, so there is nothing
+/// for a caller to inflate.
+///
+/// The concrete case is a framebuffer commit. A 1280x700 surface is 3.5
+/// MiB, which is far past the transfer cap and yet entirely legitimate -
+/// the surface's size was bounded when it was created, not by this call.
+/// Routing it through the capped path would have meant either raising the
+/// cap for everything (losing the protection where it is needed) or
+/// splitting the frame into chunks (four validations instead of one, and
+/// a window between them where the mapping could change).
+pub fn copy_from_user_into(ptr: u64, dest: &mut [u8]) -> bool {
+    if dest.is_empty() {
+        return true;
+    }
+    if !user_range_is_accessible(ptr, dest.len() as u64) {
+        return false;
+    }
+
+    // Safety: `user_range_is_accessible` has just confirmed every page of
+    // `ptr..ptr + dest.len()` is present and user-accessible in the
+    // active page tables, so the read is in-bounds and cannot fault.
+    // Source and destination cannot overlap - one is user memory in the
+    // lower half, the other a kernel allocation in the higher half. The
+    // `with_user_access` bracket is what makes this legal under SMAP.
+    crate::arch::x86_64::cpu::with_user_access(|| unsafe {
+        core::ptr::copy_nonoverlapping(ptr as *const u8, dest.as_mut_ptr(), dest.len());
+    });
+
+    true
+}
+
 /// Copies `bytes` into a user buffer, returning how many were written.
 ///
 /// Refuses rather than truncating silently if the destination is not a

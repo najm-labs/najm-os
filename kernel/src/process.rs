@@ -262,6 +262,11 @@ extern "C" fn process_entry(context_ptr: *mut u8) -> ! {
     );
     set_state(context.pid, ProcessState::Exited(exit));
 
+    // A dead process's windows come off the screen. Without this they
+    // would persist forever - and, worse, the surface ids would stay
+    // valid, so a later process reusing one would inherit its pixels.
+    crate::graphics::compositor::remove_surfaces_for(context.pid);
+
     // Dropping the context drops the `AddressSpace`, which returns every
     // frame the process owned - its pages, its stack, and the page tables
     // that reached them - to `mm::frame_pool`.

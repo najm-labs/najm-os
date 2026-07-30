@@ -48,6 +48,7 @@ extern crate alloc;
 mod arch;
 mod drivers;
 mod fs;
+mod graphics;
 mod loader;
 mod mm;
 mod process;
@@ -387,10 +388,64 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     drivers::input::init_mouse();
 
+    // The graphics stack. Themes are loaded from the boot archive if one
+    // is present, which is the customization layer ARCHITECTURE.md 2c
+    // calls the Realm Shell; the trusted path the same section requires
+    // is drawn by the compositor from kernel state and is deliberately
+    // not reachable from a theme at all.
+    let theme = match fs::read_all("/etc/theme.conf") {
+        Some(bytes) => {
+            let text = alloc::string::String::from_utf8_lossy(&bytes);
+            let (theme, applied, rejected) = graphics::theme::Theme::parse(&text);
+            serial_println!(
+                "Najm Kernel: theme loaded from /etc/theme.conf - {} setting(s) applied, {} \
+                 line(s) rejected",
+                applied,
+                rejected
+            );
+            theme
+        }
+        None => {
+            serial_println!("Najm Kernel: no /etc/theme.conf, using the built-in theme");
+            graphics::theme::Theme::DEFAULT
+        }
+    };
+
     match boot_info.framebuffer.as_mut() {
-        Some(framebuffer) => paint_framebuffer(framebuffer),
+        Some(framebuffer) => {
+            let info = framebuffer.info();
+            let buffer = framebuffer.buffer_mut();
+            // Safety: `buffer` is the framebuffer mapping the bootloader
+            // established, writable for its own length, and `info` is the
+            // geometry the bootloader reported for exactly that mapping.
+            // The `Framebuffer` takes the address rather than the slice so
+            // that every write is bounds-checked at the point of writing -
+            // see that type's documentation for why that matters for a
+            // compositor placing untrusted content.
+            let framebuffer = unsafe {
+                graphics::framebuffer::Framebuffer::new(
+                    buffer.as_mut_ptr() as u64,
+                    buffer.len(),
+                    info.width,
+                    info.height,
+                    info.stride * info.bytes_per_pixel,
+                    info.bytes_per_pixel,
+                    info.pixel_format,
+                )
+            };
+            serial_println!(
+                "Najm Kernel: framebuffer {}x{}, {} bytes/px, format {:?}",
+                info.width,
+                info.height,
+                info.bytes_per_pixel,
+                info.pixel_format
+            );
+            graphics::compositor::init(framebuffer, theme);
+            graphics::compositor::present();
+        }
         None => serial_println!(
-            "Najm Kernel: bootloader provided no framebuffer, skipping paint"
+            "Najm Kernel: bootloader provided no framebuffer - the compositor is unavailable, \
+             which is expected on a headless boot and is reported rather than assumed"
         ),
     }
 
@@ -580,6 +635,26 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let first_pid = process::spawn(first, realm::HOME);
     let second_pid = process::spawn(second, realm::GAMING);
 
+    // The graphical program, in the Gaming Realm. That placement is the
+    // point: a Gaming Realm gets exclusive fullscreen, and exclusive
+    // fullscreen still excludes the Core-reserved trust strip - so this
+    // process is the one that would expose ARCHITECTURE.md 2d threat 4 if
+    // the reservation were not real.
+    let gui_pid = match fs::read_all("/bin/gui") {
+        Some(image) => {
+            let loaded = loader::load_image(&image, "gui")
+                .unwrap_or_else(|err| panic!("could not load /bin/gui: {}", err));
+            Some(process::spawn(loaded, realm::GAMING))
+        }
+        None => {
+            serial_println!(
+                "Najm Kernel: /bin/gui is not in the boot archive - skipping the compositor \
+                 tests"
+            );
+            None
+        }
+    };
+
     // A genuinely different binary, loaded by path out of a namespace
     // that contains several things. This is what makes the filesystem
     // load-bearing: while there was one program and it *was* the ramdisk,
@@ -737,6 +812,81 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ),
     );
 
+    // The trusted-path checks. These are the ones that matter most in
+    // this whole file, because a trusted path that is merely *drawn* and
+    // a trusted path that is *protected* look identical on screen.
+    if graphics::compositor::stats().1 > 0 {
+        // Threat 1 and 4 (ARCHITECTURE.md 2d): no surface may be placed
+        // over the reserved strip, in any mode - including the Gaming
+        // Realm's exclusive fullscreen, which is precisely where a
+        // reserved region is most inconvenient and most necessary.
+        selftest::check(
+            "trust bar is unreachable by any surface",
+            !graphics::compositor::any_surface_overlaps_trust_bar(),
+            format_args!(
+                "no surface's placement intersects the top {} pixels, which the compositor \
+                 reserves for the Core-drawn trust indicator",
+                graphics::compositor::TRUST_BAR_HEIGHT
+            ),
+        );
+
+        // Threat 2: the indicator's contents come from kernel state, and
+        // this is checked by reading back what was *actually displayed*
+        // rather than what the compositor believes it drew. The
+        // difference between those two is exactly where a trusted path
+        // fails, so the self-test looks at the framebuffer itself.
+        let signature = graphics::compositor::signature_colours();
+        let mut signature_matches = true;
+        let mut mismatch = 0;
+        for (index, expected) in signature.iter().enumerate() {
+            let Some((x, y)) = graphics::compositor::signature_block_origin(index) else {
+                signature_matches = false;
+                break;
+            };
+            match graphics::compositor::read_pixel(x, y) {
+                // Compared with a tolerance rather than exactly: a
+                // framebuffer with fewer than 8 bits per channel
+                // quantizes on write, so an exact comparison would fail
+                // on hardware where the pixel is perfectly correct.
+                Some((r, g, b)) => {
+                    let close = |a: u8, b: u8| a.abs_diff(b) <= 8;
+                    if !(close(r, expected.r) && close(g, expected.g) && close(b, expected.b)) {
+                        signature_matches = false;
+                        mismatch = index;
+                        break;
+                    }
+                }
+                None => {
+                    signature_matches = false;
+                    break;
+                }
+            }
+        }
+        selftest::check(
+            "trust bar signature is drawn from Core state",
+            signature_matches,
+            format_args!(
+                "all {} per-boot signature blocks read back from the framebuffer match the \
+                 values the kernel generated (first mismatch at block {})",
+                signature.len(),
+                mismatch
+            ),
+        );
+    }
+
+    if let Some(pid) = gui_pid {
+        selftest::check(
+            "compositor surfaces",
+            process::exit_status(pid)
+                == Some(arch::x86_64::usermode::ProgramExit::Exited(23)),
+            format_args!(
+                "a Gaming Realm process created a fullscreen surface, drew a frame, had a \
+                 wrong-sized frame and a surface it does not own both refused, and exited {:?}",
+                process::exit_status(pid)
+            ),
+        );
+    }
+
     if let Some(pid) = fstest_pid {
         selftest::check(
             "filesystem syscalls",
@@ -784,6 +934,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// correct behaviour for a physical machine: finishing a self-test is not
 /// a reason to power off.
 fn epilogue() -> ! {
+    let (surfaces, frames, rejected_commits) = graphics::compositor::stats();
+    serial_println!(
+        "Najm Kernel: compositor - {} surface(s) live, {} frame(s) presented, {} commit(s) \
+         rejected",
+        surfaces,
+        frames,
+        rejected_commits
+    );
+
     let (queued, dropped) = drivers::input::stats();
     let (pointer_x, pointer_y) = drivers::input::pointer_position();
     serial_println!(
@@ -1066,74 +1225,17 @@ extern "C" fn task_background_hog() -> ! {
     sched::task::exit_task();
 }
 
-/// Fills the boot framebuffer with a solid, deliberately-chosen color,
-/// resolving the actual channel order/format the bootloader reported
-/// instead of assuming one.
-///
-/// Milestone 1 assumed an RGB-ish layout unconditionally; on the actual
-/// test hardware the bootloader reported BGR, so the "blue" fill came out
-/// orange. That was still useful as a first proof of life (any uniform
-/// color proves the mapping works), but it's not something to leave as
-/// technical debt now that fixing it properly is nearly the same amount
-/// of code.
-fn paint_framebuffer(framebuffer: &mut FrameBuffer) {
-    let info = framebuffer.info();
-    let bytes_per_pixel = info.bytes_per_pixel;
-    let pixel_format = info.pixel_format;
-    let buffer = framebuffer.buffer_mut();
-
-    // Target color: a deep blue. Channel order is resolved per-format
-    // below rather than assumed.
-    let (r, g, b): (u8, u8, u8) = (0x1e, 0x50, 0xff);
-
-    for pixel in buffer.chunks_exact_mut(bytes_per_pixel) {
-        match pixel_format {
-            PixelFormat::Rgb => {
-                pixel[0] = r;
-                if bytes_per_pixel > 1 {
-                    pixel[1] = g;
-                }
-                if bytes_per_pixel > 2 {
-                    pixel[2] = b;
-                }
-            }
-            PixelFormat::Bgr => {
-                pixel[0] = b;
-                if bytes_per_pixel > 1 {
-                    pixel[1] = g;
-                }
-                if bytes_per_pixel > 2 {
-                    pixel[2] = r;
-                }
-            }
-            PixelFormat::U8 => {
-                // Grayscale-only framebuffer: approximate luminance
-                // rather than just writing one channel and leaving the
-                // rest black.
-                pixel[0] = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-            }
-            _ => {
-                // An unrecognized/custom format (e.g. non-standard
-                // channel positions). Rather than guess at a layout we
-                // don't actually know, write a value that's at least
-                // visible in every byte, and say so over serial - this
-                // is a real gap to come back to, not something to paper
-                // over silently.
-                for byte in pixel.iter_mut() {
-                    *byte = 0xff;
-                }
-            }
-        }
-    }
-
-    serial_println!(
-        "Najm Kernel: framebuffer painted ({}x{}, format {:?}, {} bytes/px)",
-        info.width,
-        info.height,
-        pixel_format,
-        bytes_per_pixel
-    );
-}
+// `paint_framebuffer` used to live here: it filled the screen with a
+// solid colour, resolving the hardware's channel order so the fill was
+// the colour it claimed to be. It has been replaced by the graphics stack
+// in `crate::graphics`, which does the same format resolution properly
+// and then draws something meaningful on top of it.
+//
+// The one thing worth carrying forward is why the format resolution
+// existed at all: the original version assumed an RGB byte order, and on
+// the test hardware the bootloader reported BGR, so "blue" came out
+// orange. That is now handled in `graphics::framebuffer::set_pixel` for
+// every pixel rather than once for a fill.
 
 /// Parks the CPU using the `hlt` instruction instead of busy-spinning.
 ///

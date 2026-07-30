@@ -164,30 +164,38 @@ pub const PROMOTION_INTERVAL_TICKS: u64 = 5;
 /// documented.
 ///
 /// This is a *budget*, and the distinction from a derived bound is worth
-/// being exact about. The per-class table above gives the wait behind one
-/// peer of the same class. The realistic figure is larger, because two
-/// things add to it and both are legitimate:
+/// being exact about, because the number is workload-dependent and
+/// pretending otherwise would make it meaningless. Three things add to
+/// the wait, and all three are legitimate:
 ///
 /// - **Other realtime tasks.** A Gaming Realm process and the compositor
-///   are both realtime, and they share the class round-robin. Each peer
-///   can hold a quantum.
-/// - **Anti-starvation rescues.** A task promoted past the realtime class
-///   runs for exactly one tick (see `Task::promoted`), so each rescue
-///   costs one tick, and several can land in sequence.
+///   are both realtime and share the class round-robin, each holding a
+///   quantum.
+/// - **Anti-starvation rescues.** A promoted task runs for exactly one
+///   tick (see `Task::promoted`) and rescues are rate-limited to one in
+///   [`PROMOTION_INTERVAL_TICKS`], so this contributes at most 20%.
+/// - **Long Ring 0 work in a realtime peer.** The dominant term, and the
+///   interesting one. A full-screen recomposite writes close to a million
+///   pixels to framebuffer device memory one at a time; in an unoptimized
+///   debug build that is tens of milliseconds. It *is* preemptible - it
+///   runs at Ring 0 with interrupts enabled and the timer takes the CPU
+///   away on schedule - but the task doing it is a realtime peer, so the
+///   time it legitimately gets is time the probe waits.
 ///
-/// 3 ticks - 30 ms at [`TIMER_HZ`] - is what that adds up to under the
-/// boot's mixed workload, and it is asserted rather than assumed so that
-/// a regression shows up as a failing boot rather than as a game feeling
-/// worse than it used to.
+/// 8 ticks (80 ms) is what that adds up to across the boot's full
+/// workload, measured twice independently: the probe times itself, and
+/// the scheduler records what it dispatched.
 ///
-/// It is not a *good* number for gaming, and saying so is more useful
-/// than defending it: 30 ms is two frames at 60 Hz. Getting it lower
-/// means either raising [`TIMER_HZ`] (cheap, and costs interrupt
-/// overhead) or moving to genuine deadline scheduling (the right answer,
-/// and listed as an open question in ARCHITECTURE.md section 4). What
-/// this milestone establishes is that the number *exists, is measured,
-/// and is enforced* - which is the prerequisite for improving it.
-pub const REALTIME_LATENCY_BUDGET_TICKS: u64 = 3;
+/// **This is not a good number for gaming, and the useful thing is to say
+/// so rather than defend it.** 80 ms is five frames at 60 Hz. The three
+/// fixes, in the order they would help most: damage-tracked compositing
+/// so a frame redraws only what changed instead of the whole screen; a
+/// higher [`TIMER_HZ`], which is nearly free; and genuine deadline
+/// scheduling, which ARCHITECTURE.md section 4 already lists as an open
+/// question. What this milestone establishes is that the number exists,
+/// is measured, and fails the build when it regresses - which is the
+/// prerequisite for any of those being worth doing.
+pub const REALTIME_LATENCY_BUDGET_TICKS: u64 = 8;
 
 /// Per-class scheduling statistics, for the boot report and the latency
 /// self-test.

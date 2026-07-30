@@ -58,6 +58,7 @@ echo "==> packaging boot image"
 KERNEL_PATH="$REPO_ROOT/kernel/target/$TARGET/$PROFILE/najm-kernel" \
 USERLAND_PATH="$REPO_ROOT/userland/hello/target/$TARGET/$PROFILE/najm-hello" \
 USERLAND_FSTEST_PATH="$REPO_ROOT/userland/fstest/target/$TARGET/$PROFILE/najm-fstest" \
+USERLAND_GUI_PATH="$REPO_ROOT/userland/gui/target/$TARGET/$PROFILE/najm-gui" \
     cargo build --manifest-path runner/Cargo.toml "${RELEASE_FLAG[@]}" || exit 1
 
 IMAGE="$(find runner/target -name najm-bios.img -newermt '-1 hour' 2>/dev/null | head -1)"

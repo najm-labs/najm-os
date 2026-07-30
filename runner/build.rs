@@ -447,6 +447,29 @@ fn main() {
 
     // A second text file in the same directory, so `readdir` returning
     // one entry cannot be mistaken for it working.
+    // A theme file, so the customization layer ARCHITECTURE.md 2c calls
+    // the "Realm Shell" is exercised on every boot rather than only
+    // existing as a code path. Note what it can and cannot change: the
+    // trust bar's colours, yes; its contents, its position, or whether it
+    // is drawn at all, no - those come from the Core and are not
+    // reachable from a theme.
+    files.push((
+        "/etc/theme.conf",
+        b"# Najm OS theme. Colours only - see kernel/src/graphics/theme.rs\n\
+          # for what is themeable and, more importantly, what is not.\n\
+          desktop        = #0d1117\n\
+          trust_bar      = #05070b\n\
+          trust_bar.edge = #30363d\n\
+          trust_bar.text = #e6edf3\n\
+          accent.home    = #388bfd\n\
+          accent.gaming  = #f778ba\n\
+          accent.vault   = #3fb950\n\
+          accent.system  = #d29922\n\
+          pointer.fill   = #ffffff\n\
+          pointer.edge   = #161b22\n"
+            .to_vec(),
+    ));
+
     files.push((
         "/etc/version",
         format!("najm-os {}\n", env!("CARGO_PKG_VERSION")).into_bytes(),
@@ -494,6 +517,21 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-env-changed=USERLAND_FSTEST_PATH");
+
+    // The graphical program. Runs in the Gaming Realm, which is what
+    // makes it interesting: it gets exclusive fullscreen, and exclusive
+    // fullscreen still cannot reach the Core-reserved trust strip.
+    if let Some(path) = env::var_os("USERLAND_GUI_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            files.push((
+                "/bin/gui",
+                std::fs::read(&path).expect("failed to read the gui binary"),
+            ));
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!("cargo:rerun-if-env-changed=USERLAND_GUI_PATH");
 
     std::fs::write(&ramdisk_path, build_archive(&files))
         .expect("failed to write the boot archive");

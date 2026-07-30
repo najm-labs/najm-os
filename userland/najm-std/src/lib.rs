@@ -296,3 +296,80 @@ pub fn write_u64(value: u64) {
     }
     let _ = write(&digits[index..]);
 }
+
+// --- Graphics and input ---------------------------------------------
+
+/// Asks the compositor for a drawable surface.
+///
+/// Note the size is a *request*. The compositor decides the mode from the
+/// calling Realm - a Gaming Realm gets the whole content area, everything
+/// else gets a window - so a program must call `surface_info` afterwards
+/// and draw at the size it was actually given. Assuming the requested
+/// size is how a program ends up committing a buffer of the wrong length,
+/// which the kernel refuses.
+pub fn surface_create(width: u64, height: u64) -> Result<u64, u64> {
+    // Safety: no pointer arguments.
+    decode(unsafe { syscall3(sys::SURFACE_CREATE, width, height, 0) })
+}
+
+/// Reads a surface's actual geometry.
+pub fn surface_info(id: u64, info: &mut najm_abi::SurfaceInfo) -> Result<u64, u64> {
+    // Safety: `info` is a real `&mut` to a `#[repr(C)]` struct of exactly
+    // the size the kernel writes, and the kernel validates the
+    // destination against this process's page tables regardless.
+    decode(unsafe {
+        syscall3(
+            sys::SURFACE_INFO,
+            id,
+            info as *mut najm_abi::SurfaceInfo as u64,
+            0,
+        )
+    })
+}
+
+/// Hands a finished frame to the compositor.
+///
+/// `pixels` must be exactly `width * height` entries, in 0x00RRGGBB
+/// form. The kernel refuses anything else rather than accepting a short
+/// buffer - a partial commit would leave the rest of the frame holding
+/// whatever was in that surface before, and surfaces are reused between
+/// processes.
+pub fn surface_commit(id: u64, pixels: &[u32]) -> Result<u64, u64> {
+    // Safety: `pixels` is a real slice; pointer and length are consistent
+    // by construction.
+    decode(unsafe {
+        syscall3(
+            sys::SURFACE_COMMIT,
+            id,
+            pixels.as_ptr() as u64,
+            (pixels.len() * 4) as u64,
+        )
+    })
+}
+
+/// Drains up to `events.len()` input events, returning how many arrived.
+pub fn input_poll(events: &mut [najm_abi::InputEvent]) -> Result<u64, u64> {
+    // Safety: `events` is a real mutable slice, and the kernel writes at
+    // most `events.len()` entries into it.
+    decode(unsafe {
+        syscall3(
+            sys::INPUT_POLL,
+            events.as_mut_ptr() as u64,
+            events.len() as u64,
+            0,
+        )
+    })
+}
+
+/// Reads which Realm this process runs in and what it is allowed to
+/// attempt.
+pub fn realm_info(info: &mut najm_abi::RealmInfo) -> Result<u64, u64> {
+    // Safety: as `surface_info` - a real `&mut` to a `#[repr(C)]` struct,
+    // validated kernel-side regardless.
+    decode(unsafe { syscall3(sys::REALM_INFO, info as *mut najm_abi::RealmInfo as u64, 0, 0) })
+}
+
+/// Whether `e` is the "out of memory" error.
+pub fn is_enomem(e: u64) -> bool {
+    e == err::ENOMEM
+}
