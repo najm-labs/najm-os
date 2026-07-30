@@ -113,6 +113,7 @@ pub extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64, rsp_at_
         sys::SEEK => sys_seek(arg1, arg2, arg3),
         sys::STAT => sys_stat(arg1, arg2, arg3),
         sys::READDIR => sys_readdir(arg1, arg2, arg3),
+        sys::WRITE_CSTR => sys_write_cstr(arg1),
 
         sys::SURFACE_CREATE => sys_surface_create(arg1, arg2),
         sys::SURFACE_COMMIT => sys_surface_commit(arg1, arg2, arg3),
@@ -661,4 +662,71 @@ fn sys_realm_info(out_ptr: u64) -> u64 {
         Some(_) => 0,
         None => encode_error(err::EFAULT),
     }
+}
+
+/// `write_cstr(ptr) -> bytes written`
+///
+/// Writes a NUL-terminated string. The length is found by the kernel
+/// rather than supplied by the caller, which is the whole reason this
+/// exists separately from `write`: the Windows API has functions taking a
+/// pointer and no length, and a compatibility thunk is a register shuffle
+/// rather than a program - it cannot call `strlen`.
+///
+/// Finding a terminator in user memory is exactly the operation that must
+/// not be done casually. Two rules make it safe:
+///
+/// 1. **Bounded.** The scan stops at `MAX_CSTR`, so a string with no
+///    terminator is truncated rather than walking the address space.
+/// 2. **Page at a time.** Each page is validated before it is read, so a
+///    string that runs off the end of its mapping stops at the boundary
+///    instead of faulting in the kernel. Validating only the first page
+///    and then scanning would be the classic version of this bug.
+fn sys_write_cstr(ptr: u64) -> u64 {
+    /// A cap on how far the kernel will look for a terminator. 4 KiB is
+    /// far longer than any debug string and short enough that a hostile
+    /// caller cannot make the kernel scan for long.
+    const MAX_CSTR: usize = 4096;
+
+    let mut length = 0usize;
+    let mut address = ptr;
+
+    while length < MAX_CSTR {
+        // How much of the current page is left. Reading in page-sized
+        // pieces means the validation and the read cover exactly the same
+        // bytes - a scan that validated one page and then kept reading
+        // would fault in the kernel the moment the string crossed into an
+        // unmapped one.
+        let page_offset = (address & 0xFFF) as usize;
+        let in_page = 4096 - page_offset;
+        let want = core::cmp::min(in_page, MAX_CSTR - length);
+
+        let Some(chunk) = crate::mm::memory::copy_from_user(address, want) else {
+            // Unmapped. If nothing has been found yet this is simply a
+            // bad pointer; if some bytes were already read, the string
+            // ran off the end of its mapping and what was found is
+            // reported rather than discarded.
+            break;
+        };
+
+        if let Some(terminator) = chunk.iter().position(|&byte| byte == 0) {
+            length += terminator;
+            break;
+        }
+
+        length += chunk.len();
+        address += chunk.len() as u64;
+    }
+
+    if length == 0 {
+        // Either an empty string or an unreadable pointer. Distinguished
+        // by re-checking the first byte, so a program that passes a bad
+        // pointer gets an error rather than a silent success.
+        return if crate::mm::memory::copy_from_user(ptr, 1).is_some() {
+            0
+        } else {
+            encode_error(err::EFAULT)
+        };
+    }
+
+    sys_write(fd::STDOUT, ptr, length as u64)
 }

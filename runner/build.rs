@@ -378,6 +378,308 @@ fn build_archive(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
     archive
 }
 
+
+/// Builds a minimal PE32+ executable, by hand, to exercise Mirage.
+///
+/// Hand-built for the same reason `build_syscall_test_elf` is: producing
+/// one with a real toolchain would mean requiring a Windows cross-compiler
+/// to build this project, which is a large dependency for a test. Every
+/// byte below is standard, stable PE/COFF - the format has not changed in
+/// a way that matters since 1999.
+///
+/// What it exercises, and why each part is here rather than being
+/// simplified away:
+///
+/// - **A relocated base.** Its preferred base is the conventional
+///   `0x140000000`; Mirage loads it somewhere else deliberately, so the
+///   relocation table has to be applied or the string pointer it passes
+///   to `OutputDebugStringA` points into unmapped memory.
+/// - **Imports resolved by name**, through a real import descriptor with
+///   a lookup table and a separate IAT - the layout an actual linker
+///   emits, not a shortcut where the two coincide.
+/// - **Two sections with different permissions**, so the W^X path is
+///   taken rather than everything landing in one RWX blob.
+/// - **The Microsoft x64 calling convention**, so the thunks' register
+///   shuffle is genuinely required: the argument goes in RCX, and a
+///   loader that passed it straight through would deliver it as the
+///   native ABI's fourth argument.
+fn build_test_pe() -> Vec<u8> {
+    const PREFERRED_BASE: u64 = 0x1_4000_0000;
+    const SECTION_ALIGN: u32 = 0x1000;
+    const FILE_ALIGN: u32 = 0x200;
+
+    // Layout in memory (RVAs), one page per section.
+    const TEXT_RVA: u32 = 0x1000;
+    const DATA_RVA: u32 = 0x2000;
+    const IMAGE_SIZE: u32 = 0x3000;
+
+    // Layout in the file.
+    const HEADERS_SIZE: u32 = FILE_ALIGN;
+    const TEXT_RAW: u32 = FILE_ALIGN;
+    const DATA_RAW: u32 = FILE_ALIGN * 2;
+
+    // --- .rdata contents, laid out first so .text can reference it -----
+    //
+    // Everything the program's data section holds, at known offsets from
+    // DATA_RVA: the message, the import machinery, and the relocation
+    // table. Putting the import tables in the data section rather than
+    // their own is what a small linker does, and it keeps the section
+    // count down.
+    let message = b"[mirage] hello from a Windows PE binary running natively on Najm OS\n\0";
+    let message_rva = DATA_RVA;
+
+    let mut data = Vec::new();
+    data.extend_from_slice(message);
+    while data.len() % 8 != 0 {
+        data.push(0);
+    }
+
+    // Hint/name entries. Each is a 2-byte hint followed by a
+    // NUL-terminated name, which is the structure the import lookup table
+    // points at.
+    let names: [&[u8]; 2] = [b"OutputDebugStringA", b"ExitProcess"];
+    let mut hint_name_rvas = Vec::new();
+    for name in names {
+        hint_name_rvas.push(DATA_RVA + data.len() as u32);
+        data.extend_from_slice(&0u16.to_le_bytes()); // hint
+        data.extend_from_slice(name);
+        data.push(0);
+        if data.len() % 2 != 0 {
+            data.push(0);
+        }
+    }
+    while data.len() % 8 != 0 {
+        data.push(0);
+    }
+
+    // The import lookup table: what the image wants, by name.
+    let lookup_rva = DATA_RVA + data.len() as u32;
+    for rva in &hint_name_rvas {
+        data.extend_from_slice(&(*rva as u64).to_le_bytes());
+    }
+    data.extend_from_slice(&0u64.to_le_bytes()); // terminator
+
+    // The Import Address Table: where the resolved addresses go. Starts
+    // as a copy of the lookup table, which is what a linker emits - the
+    // loader overwrites it in place.
+    let iat_rva = DATA_RVA + data.len() as u32;
+    for rva in &hint_name_rvas {
+        data.extend_from_slice(&(*rva as u64).to_le_bytes());
+    }
+    data.extend_from_slice(&0u64.to_le_bytes()); // terminator
+
+    // The DLL name. Mirage resolves by function name and ignores which
+    // DLL claims to provide it, but the field is mandatory and a real
+    // image always has one.
+    let dll_name_rva = DATA_RVA + data.len() as u32;
+    data.extend_from_slice(b"KERNEL32.dll\0");
+    while data.len() % 4 != 0 {
+        data.push(0);
+    }
+
+    // The import descriptor: one entry plus the all-zero terminator.
+    let import_dir_rva = DATA_RVA + data.len() as u32;
+    data.extend_from_slice(&lookup_rva.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+    data.extend_from_slice(&0u32.to_le_bytes()); // ForwarderChain
+    data.extend_from_slice(&dll_name_rva.to_le_bytes());
+    data.extend_from_slice(&iat_rva.to_le_bytes());
+    data.extend_from_slice(&[0u8; 20]); // terminating descriptor
+
+    // --- .text ---------------------------------------------------------
+    //
+    // Microsoft x64 convention: first argument in RCX. A loader that did
+    // not translate would deliver it where the native ABI expects its
+    // fourth argument, so this code is what makes the thunks' register
+    // shuffle load-bearing rather than decorative.
+    let mut text = Vec::new();
+
+    // sub rsp, 40 - the ABI's 32 bytes of shadow space plus 8 to restore
+    // the 16-byte alignment the `call` will consume. Omitting it is the
+    // most common way hand-written x64 Windows assembly corrupts its own
+    // stack.
+    text.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+
+    // mov rcx, imm64 <message address>. An absolute address, which is
+    // precisely why this image needs a relocation - Mirage does not load
+    // it at its preferred base.
+    let message_operand_offset = text.len() + 2;
+    text.extend_from_slice(&[0x48, 0xB9]);
+    text.extend_from_slice(&(PREFERRED_BASE + message_rva as u64).to_le_bytes());
+
+    // call qword ptr [rip + disp32] -> the IAT slot for
+    // OutputDebugStringA. Calling *through* the IAT rather than to a
+    // fixed address is how every real PE calls an import.
+    let call_end = TEXT_RVA as usize + text.len() + 6;
+    let disp = iat_rva as i64 - call_end as i64;
+    text.extend_from_slice(&[0xFF, 0x15]);
+    text.extend_from_slice(&(disp as i32).to_le_bytes());
+
+    // mov ecx, 55 - the exit code, again in the Windows argument register.
+    text.extend_from_slice(&[0xB9]);
+    text.extend_from_slice(&55u32.to_le_bytes());
+
+    // call qword ptr [rip + disp32] -> ExitProcess, the second IAT slot.
+    let call_end = TEXT_RVA as usize + text.len() + 6;
+    let disp = (iat_rva + 8) as i64 - call_end as i64;
+    text.extend_from_slice(&[0xFF, 0x15]);
+    text.extend_from_slice(&(disp as i32).to_le_bytes());
+
+    // Unreachable if ExitProcess works, which is exactly why it is here:
+    // reaching it means the exit thunk returned, and `ud2` turns that
+    // into an immediate, unmistakable fault rather than execution running
+    // off into the zero-filled remainder of the page.
+    text.extend_from_slice(&[0x0F, 0x0B]);
+
+    // --- Base relocations ----------------------------------------------
+    //
+    // One entry, for the absolute address embedded in the `mov rcx`
+    // above. Without it the string pointer would still refer to the
+    // preferred base, which Mirage does not map - and the symptom would
+    // be a page fault at a plausible-looking address rather than
+    // anything naming the cause.
+    let reloc_rva = DATA_RVA + data.len() as u32;
+    let reloc_target = TEXT_RVA + message_operand_offset as u32;
+    let reloc_page = reloc_target & !0xFFF;
+    data.extend_from_slice(&reloc_page.to_le_bytes());
+    data.extend_from_slice(&16u32.to_le_bytes()); // block size: 8 header + 2 entries
+    // Type 10 (DIR64) in the high nibble, offset within the page in the low 12 bits.
+    data.extend_from_slice(&(((10u16) << 12) | ((reloc_target & 0xFFF) as u16)).to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes()); // ABSOLUTE padding entry
+    let reloc_size = 16u32;
+
+    // --- Assemble ------------------------------------------------------
+    let mut pe = vec![0u8; HEADERS_SIZE as usize];
+
+    // DOS header: the magic, and `e_lfanew` pointing at the PE header.
+    // The 60 bytes between are a real DOS stub in a linker-produced
+    // image; nothing reads them here.
+    pe[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes()); // "MZ"
+    let pe_offset = 0x80usize;
+    pe[0x3C..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+
+    let mut at = pe_offset;
+    let mut put = |pe: &mut Vec<u8>, at: &mut usize, bytes: &[u8]| {
+        pe[*at..*at + bytes.len()].copy_from_slice(bytes);
+        *at += bytes.len();
+    };
+
+    put(&mut pe, &mut at, &0x0000_4550u32.to_le_bytes()); // "PE\0\0"
+    put(&mut pe, &mut at, &0x8664u16.to_le_bytes()); // Machine: AMD64
+    put(&mut pe, &mut at, &2u16.to_le_bytes()); // NumberOfSections
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // TimeDateStamp
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // PointerToSymbolTable
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // NumberOfSymbols
+    put(&mut pe, &mut at, &240u16.to_le_bytes()); // SizeOfOptionalHeader
+    put(&mut pe, &mut at, &0x0022u16.to_le_bytes()); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    let optional_header = at;
+    put(&mut pe, &mut at, &0x020Bu16.to_le_bytes()); // PE32+
+    put(&mut pe, &mut at, &[14, 0]); // linker version
+    put(&mut pe, &mut at, &(text.len() as u32).to_le_bytes()); // SizeOfCode
+    put(&mut pe, &mut at, &(data.len() as u32).to_le_bytes()); // SizeOfInitializedData
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // SizeOfUninitializedData
+    put(&mut pe, &mut at, &TEXT_RVA.to_le_bytes()); // AddressOfEntryPoint
+    put(&mut pe, &mut at, &TEXT_RVA.to_le_bytes()); // BaseOfCode
+    put(&mut pe, &mut at, &PREFERRED_BASE.to_le_bytes()); // ImageBase
+    put(&mut pe, &mut at, &SECTION_ALIGN.to_le_bytes());
+    put(&mut pe, &mut at, &FILE_ALIGN.to_le_bytes());
+    put(&mut pe, &mut at, &[6, 0, 0, 0]); // OS version
+    put(&mut pe, &mut at, &[0, 0, 0, 0]); // image version
+    put(&mut pe, &mut at, &[6, 0, 0, 0]); // subsystem version
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // Win32VersionValue
+    put(&mut pe, &mut at, &IMAGE_SIZE.to_le_bytes()); // SizeOfImage
+    put(&mut pe, &mut at, &HEADERS_SIZE.to_le_bytes()); // SizeOfHeaders
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // CheckSum
+    put(&mut pe, &mut at, &3u16.to_le_bytes()); // Subsystem: console
+    put(&mut pe, &mut at, &0x0160u16.to_le_bytes()); // DllCharacteristics: DYNAMIC_BASE | NX_COMPAT
+    put(&mut pe, &mut at, &0x100000u64.to_le_bytes()); // SizeOfStackReserve
+    put(&mut pe, &mut at, &0x1000u64.to_le_bytes()); // SizeOfStackCommit
+    put(&mut pe, &mut at, &0x100000u64.to_le_bytes()); // SizeOfHeapReserve
+    put(&mut pe, &mut at, &0x1000u64.to_le_bytes()); // SizeOfHeapCommit
+    put(&mut pe, &mut at, &0u32.to_le_bytes()); // LoaderFlags
+    put(&mut pe, &mut at, &16u32.to_le_bytes()); // NumberOfRvaAndSizes
+
+    // Data directories. Only import (1) and base relocation (5) are
+    // populated; the rest stay zero, which is how a loader knows they are
+    // absent rather than empty.
+    let directories = at;
+    at = directories + 16 * 8;
+    let mut directory = |pe: &mut Vec<u8>, index: usize, rva: u32, size: u32| {
+        let base = directories + index * 8;
+        pe[base..base + 4].copy_from_slice(&rva.to_le_bytes());
+        pe[base + 4..base + 8].copy_from_slice(&size.to_le_bytes());
+    };
+    directory(&mut pe, 1, import_dir_rva, 40);
+    directory(&mut pe, 5, reloc_rva, reloc_size);
+
+    assert_eq!(
+        at - optional_header,
+        240,
+        "optional header size drifted from the field layout above"
+    );
+
+    // Section table.
+    let mut section = |pe: &mut Vec<u8>,
+                       at: &mut usize,
+                       name: &[u8; 8],
+                       virtual_size: u32,
+                       virtual_address: u32,
+                       raw_size: u32,
+                       raw_offset: u32,
+                       characteristics: u32| {
+        pe[*at..*at + 8].copy_from_slice(name);
+        *at += 8;
+        pe[*at..*at + 4].copy_from_slice(&virtual_size.to_le_bytes());
+        *at += 4;
+        pe[*at..*at + 4].copy_from_slice(&virtual_address.to_le_bytes());
+        *at += 4;
+        pe[*at..*at + 4].copy_from_slice(&raw_size.to_le_bytes());
+        *at += 4;
+        pe[*at..*at + 4].copy_from_slice(&raw_offset.to_le_bytes());
+        *at += 4;
+        *at += 12; // relocations and line numbers: none
+        pe[*at..*at + 4].copy_from_slice(&characteristics.to_le_bytes());
+        *at += 4;
+    };
+
+    // .text: read + execute, never writable. .rdata: read + write,
+    // because the loader writes resolved addresses into the IAT that
+    // lives there - a genuinely writable data section rather than one
+    // made writable to avoid thinking about it.
+    section(
+        &mut pe,
+        &mut at,
+        b".text\0\0\0",
+        text.len() as u32,
+        TEXT_RVA,
+        text.len().next_multiple_of(FILE_ALIGN as usize) as u32,
+        TEXT_RAW,
+        0x6000_0020, // CODE | EXECUTE | READ
+    );
+    section(
+        &mut pe,
+        &mut at,
+        b".rdata\0\0",
+        data.len() as u32,
+        DATA_RVA,
+        data.len().next_multiple_of(FILE_ALIGN as usize) as u32,
+        DATA_RAW,
+        0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+    );
+
+    // Section contents, each padded to the file alignment the header
+    // claims. A mismatch here is the kind of thing a loader either
+    // tolerates silently or rejects confusingly, so it is made exact.
+    pe.resize(TEXT_RAW as usize, 0);
+    pe.extend_from_slice(&text);
+    pe.resize(DATA_RAW as usize, 0);
+    pe.extend_from_slice(&data);
+    pe.resize(pe.len().next_multiple_of(FILE_ALIGN as usize), 0);
+
+    pe
+}
+
 fn main() {
     let kernel_path = PathBuf::from(env::var_os("KERNEL_PATH").unwrap_or_else(|| {
         panic!(
@@ -436,6 +738,11 @@ fn main() {
     // leak, so this is coverage worth keeping rather than legacy worth
     // deleting.
     files.push(("/bin/bss-test", build_syscall_test_elf()));
+
+    // A Windows binary, for Mirage. Hand-built for the same reason the
+    // ELF above is: requiring a Windows cross-compiler to build this
+    // project would be a large dependency for one test.
+    files.push(("/bin/hello.exe", build_test_pe()));
 
     // A plain text file, so the filesystem is proven to serve content the
     // kernel did not itself produce, and a `read` syscall has something

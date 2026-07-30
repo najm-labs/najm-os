@@ -50,6 +50,7 @@ mod drivers;
 mod fs;
 mod graphics;
 mod loader;
+mod mirage;
 mod mm;
 mod process;
 mod realm;
@@ -655,6 +656,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     };
 
+    // A Windows binary, through Mirage. Placed in the Gaming Realm
+    // because that is what the layer exists for - see `crate::mirage` for
+    // exactly how far it goes and, more usefully, how far it does not.
+    mirage::win32::report();
+    let mirage_pid = match fs::read_all("/bin/hello.exe") {
+        Some(image) => match mirage::load_image(&image, "hello.exe") {
+            Ok(loaded) => Some(process::spawn(loaded, realm::GAMING)),
+            Err(err) => {
+                serial_println!("Najm Kernel: MIRAGE FAILURE - {}", err);
+                None
+            }
+        },
+        None => {
+            serial_println!("Najm Kernel: /bin/hello.exe is not in the boot archive");
+            None
+        }
+    };
+
     // A genuinely different binary, loaded by path out of a namespace
     // that contains several things. This is what makes the filesystem
     // load-bearing: while there was one program and it *was* the ramdisk,
@@ -870,6 +889,28 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                  values the kernel generated (first mismatch at block {})",
                 signature.len(),
                 mismatch
+            ),
+        );
+    }
+
+    if let Some(pid) = mirage_pid {
+        // 55 is the exit code the hand-built PE passes to ExitProcess, in
+        // RCX per the Microsoft x64 convention. Its arriving intact is
+        // the whole test: it proves the PE was parsed, relocated away
+        // from its preferred base, had its import table bound to
+        // generated thunks, and that those thunks translated the calling
+        // convention correctly. A loader that passed registers through
+        // unchanged would deliver the exit code where the native ABI
+        // expects its fourth argument, and the status would be whatever
+        // happened to be in RDI.
+        selftest::check(
+            "Mirage runs a Windows binary",
+            process::exit_status(pid)
+                == Some(arch::x86_64::usermode::ProgramExit::Exited(55)),
+            format_args!(
+                "a PE32+ image was relocated, had its imports bound to ABI-translation thunks, \
+                 printed through OutputDebugStringA and exited via ExitProcess with {:?}",
+                process::exit_status(pid)
             ),
         );
     }

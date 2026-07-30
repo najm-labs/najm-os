@@ -85,6 +85,16 @@ pub mod sys {
     pub const READDIR: u64 = 21;
     /// `stat(path_ptr, path_len, out_ptr) -> 0` - writes a [`FileInfo`].
     pub const STAT: u64 = 22;
+    /// `write_cstr(ptr) -> written` - writes a NUL-terminated string to
+    /// the console.
+    ///
+    /// Exists because the Windows API has functions like
+    /// `OutputDebugStringA` that take a pointer and no length, and a
+    /// compatibility thunk cannot compute one - it is a register shuffle,
+    /// not a program. The kernel does the bounded scan instead, which is
+    /// the right place for it: finding the terminator means reading user
+    /// memory, and the kernel is the only side that can do that safely.
+    pub const WRITE_CSTR: u64 = 23;
 
     // --- memory ------------------------------------------------------
     /// `map(len, flags) -> addr` - anonymous memory, page-granular.
