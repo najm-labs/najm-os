@@ -45,7 +45,6 @@
 
 use crate::serial_println;
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -344,30 +343,38 @@ impl ProgramExit {
     }
 }
 
-/// The Ring 0 stack pointer to resume when the currently running Ring 3
-/// program ends, or 0 when no program is running.
-///
-/// A `static` rather than a local in `run_program`, because the code that
-/// needs to read it - the page fault and general protection fault
-/// handlers in `interrupts.rs` - is reached by a CPU exception, not by a
-/// call chain that could have been handed a pointer. An `AtomicU64`
-/// rather than a `Mutex<u64>` specifically because a fault handler must
-/// never block on a lock: a fault that happened while the same lock was
-/// held would deadlock the machine in the one situation where clear
-/// diagnostics matter most.
-///
-/// Single-slot, so Ring 3 execution cannot nest. That's asserted in
-/// `run_program` rather than left as an unstated assumption - a nested
-/// entry would overwrite this and silently strand the outer context.
-static SUPERVISOR_RSP: AtomicU64 = AtomicU64::new(0);
+// The Ring 0 resume point for a running Ring 3 program is **per task**,
+// not global. It lives in `sched::task::Task::supervisor_rsp` and is
+// reached through `sched::task::supervisor_slot()`, which returns the
+// current task's slot - or the boot context's, for the self-tests that
+// run Ring 3 code before any task exists.
+//
+// It was a single `AtomicU64` here until processes became tasks. One
+// global slot is correct exactly as long as Ring 3 execution cannot nest
+// or interleave, which was true while the only Ring 3 code ran from
+// `kernel_main`. Once two tasks can each be inside a Ring 3 program, the
+// second one to enter overwrites the first one's resume point, and the
+// first program's fault then returns into a stack frame that no longer
+// exists - a corrupted `ret` into freed memory, which is about as bad as
+// a scheduler bug gets.
+//
+// The reason it has to be reachable without being passed as an argument
+// is unchanged: the code that reads it is a CPU fault handler, reached by
+// an exception rather than by a call chain that could have been handed a
+// pointer.
 
-/// Whether a Ring 3 program is currently running - and therefore whether
-/// `end_program` has a supervisor context to return to. The fault
-/// handlers check this before trying to terminate "the running program,"
-/// since a Ring 3 fault with no program running would mean something far
-/// stranger has happened than a misbehaving user binary.
+/// Whether a Ring 3 program is currently running on the current context -
+/// and therefore whether `end_program` has a supervisor context to return
+/// to. The fault handlers check this before trying to terminate "the
+/// running program," since a Ring 3 fault with no program running would
+/// mean something far stranger has happened than a misbehaving user
+/// binary.
 pub fn program_is_running() -> bool {
-    SUPERVISOR_RSP.load(Ordering::SeqCst) != 0
+    let slot = crate::sched::task::supervisor_slot();
+    // Safety: `supervisor_slot` returns a pointer to either a field of
+    // the live current `Task` (heap-stable) or to a `static` - both valid
+    // for the duration of this read.
+    unsafe { slot.read_volatile() != 0 }
 }
 
 /// Ends the running Ring 3 program and resumes whoever called
@@ -383,7 +390,10 @@ pub fn program_is_running() -> bool {
 /// `program_is_running()` first; reaching here without a saved context
 /// would mean jumping to a stack pointer of 0.
 pub fn end_program(exit: ProgramExit) -> ! {
-    let supervisor_rsp = SUPERVISOR_RSP.load(Ordering::SeqCst);
+    let slot = crate::sched::task::supervisor_slot();
+    // Safety: as `program_is_running` - the pointer names a live field or
+    // a static.
+    let supervisor_rsp = unsafe { slot.read_volatile() };
     assert_ne!(
         supervisor_rsp, 0,
         "end_program called with no Ring 3 program running - check program_is_running() first"
@@ -432,20 +442,29 @@ pub unsafe fn run_program(entry: u64, stack_top: u64) -> ProgramExit {
     // here. `SUPERVISOR_RSP.as_ptr()` is a valid, permanently-live
     // pointer to a `static`, and the assert above guarantees nothing else
     // is currently using that slot.
+    let slot = crate::sched::task::supervisor_slot();
+
     let raw = unsafe {
         enter_usermode_and_wait(
             entry,
             stack_top,
             code_selector.0 as u64,
             data_selector.0 as u64,
-            SUPERVISOR_RSP.as_ptr(),
+            slot,
+            super::gdt::privilege_stack_ptr(),
         )
     };
 
     // Cleared *before* anything below can fault or panic, so a failure in
     // the reporting path can't leave a stale resume point pointing at
     // this function's now-dead frame.
-    SUPERVISOR_RSP.store(0, Ordering::SeqCst);
+    //
+    // Safety: the slot pointer names the same live field or static it did
+    // before the transition - the current task cannot have changed, since
+    // control only reaches here by resuming *this* context.
+    unsafe {
+        slot.write_volatile(0);
+    }
 
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
@@ -497,6 +516,7 @@ unsafe extern "C" fn enter_usermode_and_wait(
     code_selector: u64,
     data_selector: u64,
     supervisor_rsp_out: *mut u64,
+    tss_rsp0_out: *mut u64,
 ) -> u64 {
     naked_asm!(
         // Save the Ring 0 context `return_to_supervisor` will restore.
@@ -513,6 +533,38 @@ unsafe extern "C" fn enter_usermode_and_wait(
         // Publish the resulting RSP through `supervisor_rsp_out` (5th
         // arg, R8 per SysV64) so the fault handlers can find it.
         "mov [r8], rsp",
+        // And publish it, minus 8, as TSS RSP0 (6th arg, R9).
+        //
+        // This line is the difference between Ring 3 preemption working
+        // and silently corrupting the kernel stack, so it is worth
+        // spelling out completely.
+        //
+        // RSP0 is the stack the CPU switches to on any Ring 3 -> Ring 0
+        // transition. It used to be one fixed buffer shared by
+        // everything, which made preemption unsafe (a parked program's
+        // interrupt frame sat on memory the next Ring 3 entry reused).
+        // The obvious fix - point RSP0 at the current *task's* kernel
+        // stack - is wrong in a way that looks right: this task is
+        // already using the top of that stack. `run_program`'s frame and
+        // everything that called it live between RSP and the stack top,
+        // and they have to survive the whole Ring 3 excursion, because
+        // returning from Ring 3 means returning *into* them. Pointing
+        // RSP0 at the top would have the very first syscall's interrupt
+        // frame land directly on top of the frames it is supposed to
+        // return to.
+        //
+        // The correct value is the stack pointer *right here*: everything
+        // above it is live, everything below is free. RSP is 8 (mod 16)
+        // at this point (the `call` pushed a return address, then six
+        // more pushes), and the syscall entry stub's alignment argument
+        // requires RSP0 to be 16-byte aligned - so the value stored is
+        // RSP - 8, which is both aligned and still below every live byte.
+        //
+        // The five pushes that follow build the `iretq` frame and are
+        // consumed by `iretq` itself, so they are gone before any Ring 3
+        // code runs and cannot be clobbered.
+        "lea rax, [rsp - 8]",
+        "mov [r9], rax",
         // `iretq` pops, in order: RIP, CS, RFLAGS, RSP, SS - so this
         // pushes them in exactly the reverse order, SS first.
         "push rcx", // SS = data_selector (4th arg, RCX per SysV64)

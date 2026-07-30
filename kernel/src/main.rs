@@ -49,6 +49,7 @@ mod arch;
 mod drivers;
 mod loader;
 mod mm;
+mod process;
 mod realm;
 mod sched;
 mod security;
@@ -209,6 +210,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // info, the framebuffer, the ramdisk and the heap are all in the
     // higher half (verified by the check immediately below), and no user
     // process exists yet.
+    // Recorded before any process exists, so "the kernel's address space"
+    // and "whatever is currently in CR3" can never be confused - they are
+    // the same thing only until the first process runs, and a function
+    // that conflated them would restore a process's page tables while
+    // believing it had restored the kernel's.
+    mm::address_space::record_kernel_root();
+
     let cleared = unsafe { mm::memory::clear_lower_half_mappings() };
     if !cleared.is_empty() {
         serial_println!(
@@ -469,17 +477,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         ramdisk_len
     );
 
-    let exit = loader::load_and_run(ramdisk);
-    // Status 7 is what `userland/hello`'s `_start` passes to `exit`. If
-    // the ramdisk is instead the hand-encoded fallback from
-    // runner/build.rs (built when USERLAND_PATH isn't set), that one
-    // exits with 42 - so a mismatch reported here is the fastest way to
-    // notice the boot image was built without the userland crate.
-    report_program_exit(
-        "ELF-loaded program",
-        exit,
-        arch::x86_64::usermode::ProgramExit::Exited(7),
-    );
+    // Two processes from the same image, each in its own address space.
+    //
+    // Two rather than one, and deliberately the *same* image: both load
+    // at 0x400000, because the loader supports only `ET_EXEC` and that is
+    // where the linker script puts them. Before per-process address
+    // spaces this was simply impossible - the second `map_to` would fail
+    // with "already mapped", because there was one set of page tables and
+    // that address was already taken. Two live processes at the same
+    // virtual address is therefore not a nice-to-have here; it is the
+    // observable difference between "we have address spaces" and "we do
+    // not."
+    //
+    // They also give Ring 3 preemption something to be visible in: they
+    // are scheduled alongside the kernel tasks below, and their output
+    // interleaves with everything else.
+    let frames_free_before = mm::frame_pool::stats().0;
+
+    let first = loader::load_image(ramdisk, "hello")
+        .unwrap_or_else(|err| panic!("could not load the ramdisk image: {}", err));
+    let second = loader::load_image(ramdisk, "hello (second instance)")
+        .unwrap_or_else(|err| panic!("could not load the ramdisk image a second time: {}", err));
+
+    let first_pid = process::spawn(first, realm::HOME);
+    let second_pid = process::spawn(second, realm::GAMING);
 
     // Proof the kernel is not merely *reached* but genuinely healthy
     // afterwards: hardware interrupts still have to be enabled (they are
@@ -510,6 +531,58 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // no ending to report. See `run_until_idle` for why that changed.
     serial_println!("Najm Kernel: handing the CPU to the scheduler");
     sched::task::run_until_idle();
+
+    // Both processes must have run to completion, in their own address
+    // spaces, at the same virtual addresses.
+    let first_exit = process::exit_status(first_pid);
+    let second_exit = process::exit_status(second_pid);
+    let expected = Some(arch::x86_64::usermode::ProgramExit::Exited(7));
+    selftest::check(
+        "concurrent processes",
+        first_exit == expected && second_exit == expected,
+        format_args!(
+            "two processes both loaded at {:#x} in separate address spaces exited {:?} and {:?} \
+             (expected {:?} each)",
+            mm::layout::USER_IMAGE_BASE,
+            first_exit,
+            second_exit,
+            expected
+        ),
+    );
+
+    // The headline claim of this milestone, checked rather than inferred.
+    // ARCHITECTURE.md section 4 recorded "a Ring 3 program cannot
+    // currently be preempted" as a real limitation; this is the evidence
+    // that it no longer holds. A zero here would mean user programs are
+    // still running to completion uninterrupted - which would look
+    // identical in every other respect, since they are short.
+    selftest::check(
+        "Ring 3 preemption",
+        arch::x86_64::interrupts::ring3_preemptions() > 0,
+        format_args!(
+            "the timer took the CPU away from a program executing at Ring 3 {} times",
+            arch::x86_64::interrupts::ring3_preemptions()
+        ),
+    );
+
+    // And their memory must have come back. This is the check that makes
+    // "address spaces are torn down" a fact rather than a claim: the
+    // frame pool was empty before the processes were built, and every
+    // frame in it now was returned by an `AddressSpace::drop`.
+    let frames_free_after = mm::frame_pool::stats().0;
+    selftest::check(
+        "process memory reclaimed",
+        frames_free_after > frames_free_before,
+        format_args!(
+            "the frame pool went from {} free frames to {} after both processes exited - their \
+             pages, stacks and page tables were all returned",
+            frames_free_before, frames_free_after
+        ),
+    );
+
+    for (pid, name, state) in process::snapshot() {
+        serial_println!("Najm Kernel: process {} ({}) - {:?}", pid, name, state);
+    }
     selftest::check(
         "preemption",
         PREEMPTIONS_OBSERVED.load(Ordering::SeqCst) > 0,

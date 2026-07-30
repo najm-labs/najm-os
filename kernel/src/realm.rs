@@ -28,6 +28,102 @@ use alloc::boxed::Box;
 /// (`Box<dyn Any>`) or an enum covering every right, and building that
 /// machinery before there's a second consumer of it would be guessing at
 /// a shape rather than discovering one from real use.
+/// A Realm's identity and rights, in the form a *process* can be given.
+///
+/// This is deliberately not the same thing as [`RealmContext`], and the
+/// difference is worth being precise about, because it looks like
+/// duplication and is not.
+///
+/// `RealmContext` holds typed `Capability<R>` tokens. That is the
+/// stronger mechanism - a function requiring a token cannot be called
+/// without one, so a missing right is a value that does not exist rather
+/// than a check that could be skipped. It works because the holder is
+/// *kernel code*, which can be handed a Rust value.
+///
+/// A Ring 3 process cannot hold a Rust value. Its rights have to be
+/// something the kernel consults on its behalf when it makes a syscall,
+/// which means a runtime lookup keyed by identity - a bitmask. That is
+/// genuinely weaker, and pretending otherwise would be the kind of
+/// security theatre this project's documentation exists to avoid. What
+/// keeps it honest is that the bitmask is *kernel-side*: the process
+/// never holds it, cannot present it, and cannot modify it. It is
+/// capability-*based* access control in the sense that rights are
+/// per-process and unforgeable, without the compile-time guarantee that
+/// only applies within the kernel.
+#[derive(Debug, Clone, Copy)]
+pub struct RealmProfile {
+    /// Diagnostic name. Still trusted outright - see the module docs and
+    /// ARCHITECTURE.md section 2e, which describes the verification that
+    /// has to sit in front of this and does not exist yet.
+    pub name: &'static str,
+    /// One of `najm_abi::realm_kind`.
+    pub kind: u64,
+    /// Bitmask of `najm_abi::capability_bits`.
+    pub capabilities: u64,
+}
+
+impl RealmProfile {
+    /// Whether this Realm holds `right`, one of the
+    /// `najm_abi::capability_bits` constants.
+    pub fn allows(&self, right: u64) -> bool {
+        self.capabilities & right == right
+    }
+}
+
+/// The default any application gets, per ARCHITECTURE.md section 2e:
+/// elevated placement is a credential earned in advance, never a request
+/// honoured at install time. Broad but fully auditable.
+pub const HOME: RealmProfile = RealmProfile {
+    name: "Home Realm",
+    kind: najm_abi::realm_kind::HOME,
+    capabilities: najm_abi::capability_bits::SERIAL_WRITE
+        | najm_abi::capability_bits::TIMER_READ
+        | najm_abi::capability_bits::FILE_READ
+        | najm_abi::capability_bits::IPC_CONNECT
+        | najm_abi::capability_bits::SURFACE_CREATE
+        | najm_abi::capability_bits::INPUT_READ,
+};
+
+/// Bounded-latency scheduling and exclusive scanout. Note what it does
+/// *not* get: `FILE_WRITE` and `PROCESS_SPAWN`. A game needs the CPU and
+/// the screen; it does not need to write arbitrary files or launch
+/// arbitrary programs, and the Realm that gets the most privileged
+/// treatment from the scheduler is exactly the one where a narrow
+/// capability set matters most.
+pub const GAMING: RealmProfile = RealmProfile {
+    name: "Gaming Realm",
+    kind: najm_abi::realm_kind::GAMING,
+    capabilities: najm_abi::capability_bits::SERIAL_WRITE
+        | najm_abi::capability_bits::TIMER_READ
+        | najm_abi::capability_bits::FILE_READ
+        | najm_abi::capability_bits::SURFACE_CREATE
+        | najm_abi::capability_bits::INPUT_READ
+        | najm_abi::capability_bits::EXCLUSIVE_SCANOUT,
+};
+
+/// Integrity over performance. No `SERIAL_WRITE` (the console is a shared
+/// resource other Realms observe), no `INPUT_READ` (an input stream is an
+/// introspection channel), no `SURFACE_CREATE` from other Realms' point
+/// of view. Its window is drawn by the compositor with a trust indicator
+/// no other Realm can reproduce - see ARCHITECTURE.md section 2d.
+pub const VAULT: RealmProfile = RealmProfile {
+    name: "Vault Realm",
+    kind: najm_abi::realm_kind::VAULT,
+    capabilities: najm_abi::capability_bits::TIMER_READ
+        | najm_abi::capability_bits::FILE_READ
+        | najm_abi::capability_bits::FILE_WRITE
+        | najm_abi::capability_bits::SURFACE_CREATE,
+};
+
+/// The compositor and other Core-adjacent services. Not assignable to an
+/// installed application by any path - it is listed so a process can
+/// observe that it is running in it, never request it.
+pub const SYSTEM: RealmProfile = RealmProfile {
+    name: "System Realm",
+    kind: najm_abi::realm_kind::SYSTEM,
+    capabilities: u64::MAX,
+};
+
 pub struct RealmContext {
     pub name: &'static str,
     pub serial_cap: Option<Capability<SerialWrite>>,

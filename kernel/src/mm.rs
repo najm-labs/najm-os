@@ -4,7 +4,9 @@
 //! included) already use for this exact subsystem - familiar at a glance
 //! to anyone who's read kernel source before.
 
+pub mod address_space;
 pub mod allocator;
+pub mod frame_pool;
 pub mod kstack;
 pub mod layout;
 pub mod memory;

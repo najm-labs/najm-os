@@ -35,6 +35,8 @@
 //! closely rather than trusting on faith.
 
 use crate::mm::kstack::{self, KernelStack};
+use x86_64::structures::paging::PhysFrame;
+use x86_64::VirtAddr;
 use crate::serial_println;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -83,6 +85,27 @@ pub struct Task {
     /// The stack this task owns, with its guard page. Returned to
     /// `mm::kstack` in `Drop`.
     stack: KernelStack,
+    /// The PML4 to load into CR3 when this task is scheduled, or `None`
+    /// for a pure kernel task, which runs in whatever address space
+    /// happens to be current.
+    ///
+    /// A kernel task genuinely does not care: every address space maps
+    /// the kernel identically in its higher half, so kernel code, kernel
+    /// stacks and the heap are reachable from all of them. Only a task
+    /// with *user* mappings needs a specific one.
+    address_space_root: Option<PhysFrame>,
+    /// Where `usermode::run_program` saved the Ring 0 context to resume
+    /// when this task's Ring 3 program ends, or 0 if it is not running
+    /// one.
+    ///
+    /// Per-task rather than the single global it used to be. With one
+    /// global slot, two tasks each running a Ring 3 program would
+    /// overwrite each other's resume point, and the second program to
+    /// fault would return into the first program's already-dead stack
+    /// frame. That was unreachable while Ring 3 code only ran from the
+    /// boot path; it becomes reachable the moment processes are tasks,
+    /// which is what this milestone does.
+    supervisor_rsp: u64,
 }
 
 // Safety: the `KernelStack` slot is exclusively owned by this `Task`
@@ -95,6 +118,35 @@ pub struct Task {
 unsafe impl Send for Task {}
 
 impl Task {
+    /// The value TSS RSP0 must hold while this task is scheduled.
+    ///
+    /// Not simply the stack top, and the difference is the whole reason
+    /// Ring 3 preemption is subtle. A task that is *inside a Ring 3
+    /// program* is already using the top of its kernel stack: the frames
+    /// belonging to `run_program` and everything that called it sit
+    /// between `supervisor_rsp` and the top, and they must survive the
+    /// excursion because returning from Ring 3 means returning into them.
+    /// Pointing RSP0 at the top would put the next syscall's interrupt
+    /// frame directly on top of them.
+    ///
+    /// `supervisor_rsp` is exactly the boundary: live above, free below.
+    /// The `- 8` restores 16-byte alignment, which the syscall entry
+    /// stub's own alignment argument depends on (`enter_usermode_and_wait`
+    /// writes the same value into RSP0 at the moment of entry; this is
+    /// what keeps it correct across a *preemption* and back).
+    ///
+    /// A task with no Ring 3 program running has an empty kernel stack
+    /// from the CPU's point of view - it can only be in Ring 0 - so the
+    /// top is right for it, and is also simply unused, since nothing will
+    /// transition into Ring 0 from a task that never left it.
+    fn kernel_rsp0(&self) -> u64 {
+        if self.supervisor_rsp != 0 {
+            self.supervisor_rsp - 8
+        } else {
+            self.stack.top
+        }
+    }
+
     /// Builds a new task ready to run `entry` the first time it's
     /// switched to. `entry` must never return (enforced by the `-> !` in
     /// its type) - there is no mechanism here for a task to "return
@@ -146,6 +198,8 @@ impl Task {
         Task {
             stack_pointer: rsp,
             stack,
+            address_space_root: None,
+            supervisor_rsp: 0,
         }
     }
 }
@@ -229,6 +283,8 @@ impl Task {
         Task {
             stack_pointer: rsp,
             stack,
+            address_space_root: None,
+            supervisor_rsp: 0,
         }
     }
 }
@@ -411,6 +467,28 @@ pub fn spawn_with_context(entry: extern "C" fn(*mut u8) -> !, context: *mut u8) 
     });
 }
 
+/// Spawns a task bound to a specific address space - i.e. a process.
+///
+/// The address space root is recorded on the `Task` rather than being
+/// loaded by the task's own entry point, because it has to be in place
+/// *before* the task's first instruction runs and again after every
+/// preemption. A task that loaded CR3 itself would be correct exactly
+/// once: the first time it was scheduled. Every subsequent resume would
+/// run its user code against whichever address space the previous task
+/// left loaded.
+pub fn spawn_process(
+    entry: extern "C" fn(*mut u8) -> !,
+    context: *mut u8,
+    address_space_root: PhysFrame,
+) {
+    let mut task = Task::new_with_context(entry, context);
+    task.address_space_root = Some(address_space_root);
+    let task = Box::new(task);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER.lock().ready_queue.push_back(task);
+    });
+}
+
 /// Voluntarily gives up the CPU to the next ready task, if there is one.
 /// Must only be called from within a task that was itself started via
 /// `spawn` + `start` - calling this before any task is running has
@@ -469,15 +547,13 @@ fn yield_inner(kind: SwitchKind) {
     let switch = plan_switch(kind);
 
     match switch {
-        Some((current_stack_out, next_stack)) => {
-            // Safety: `current_stack_out` points into a `Task` now owned
-            // by `SCHEDULER.ready_queue` (heap-stable per the `Box<Task>`
-            // reasoning in `Scheduler`), and `next_stack` is either a
-            // fresh `Task::new` stack or a stack pointer previously saved
-            // for some other task - both are exactly what
-            // `context_switch`'s contract requires.
+        Some(switch) => {
+            // Safety: interrupts are disabled (just above), the scheduler
+            // lock was released inside `plan_switch`, and `switch` came
+            // from that call - the three preconditions `perform_switch`
+            // states.
             unsafe {
-                context_switch(current_stack_out, next_stack);
+                perform_switch(switch);
             }
 
             // Execution returns here later - possibly much later, and
@@ -521,13 +597,12 @@ pub fn preempt() {
     // No interrupt-flag juggling here, unlike `yield_now`: this is only
     // ever reached from an interrupt gate, which already cleared IF, and
     // the eventual `iretq` restores the interrupted context's own flags.
-    if let Some((current_stack_out, next_stack)) = plan_switch(SwitchKind::Preemptive) {
-        // Safety: identical to the `yield_now` call site above - both
-        // pointers come from `plan_switch`, which only ever produces them
-        // from heap-stable `Box<Task>` allocations it has just placed in
-        // the scheduler.
+    if let Some(switch) = plan_switch(SwitchKind::Preemptive) {
+        // Safety: this is only ever reached from an interrupt gate, which
+        // already cleared IF, and `plan_switch` released the scheduler
+        // lock before returning.
         unsafe {
-            context_switch(current_stack_out, next_stack);
+            perform_switch(switch);
         }
     }
 }
@@ -561,7 +636,7 @@ enum SwitchKind {
 ///
 /// Callers must have interrupts disabled: see the comments in `yield_now`
 /// and `preempt` for the two different reasons each one already does.
-fn plan_switch(kind: SwitchKind) -> Option<(*mut u64, u64)> {
+fn plan_switch(kind: SwitchKind) -> Option<Switch> {
     let mut scheduler = SCHEDULER.lock();
 
     let next = scheduler.ready_queue.pop_front()?;
@@ -597,12 +672,135 @@ fn plan_switch(kind: SwitchKind) -> Option<(*mut u64, u64)> {
     // `Task` this points at, and therefore this pointer itself, stays
     // valid.
     let current_stack_out: *mut u64 = &mut current.stack_pointer;
-    let next_stack = next.stack_pointer;
+    let switch = Switch {
+        current_stack_out,
+        next_stack: next.stack_pointer,
+        next_kernel_stack_top: next.kernel_rsp0(),
+        next_address_space: next.address_space_root,
+    };
 
     scheduler.ready_queue.push_back(current);
     scheduler.current = Some(next);
 
-    Some((current_stack_out, next_stack))
+    Some(switch)
+}
+
+/// Everything `perform_switch` needs to move the CPU onto another task.
+struct Switch {
+    current_stack_out: *mut u64,
+    next_stack: u64,
+    /// The incoming task's kernel stack top, which becomes TSS RSP0.
+    next_kernel_stack_top: u64,
+    /// The incoming task's address space, if it has one of its own.
+    next_address_space: Option<PhysFrame>,
+}
+
+/// Loads the incoming task's address space and kernel stack, then
+/// switches to it.
+///
+/// The two lines before `context_switch` are what make Ring 3 preemption
+/// safe, and both are easy to leave out without anything failing
+/// immediately:
+///
+/// - **RSP0.** The CPU switches to this stack on any Ring 3 -> Ring 0
+///   transition. Pointing it at the incoming task's own kernel stack is
+///   what stops two user programs' interrupt frames from landing on the
+///   same memory. Miss it, and preempting a Ring 3 program strands its
+///   saved state on a stack the next Ring 3 entry overwrites.
+/// - **CR3.** Without it a process would run against whichever address
+///   space happened to be loaded, seeing another process's memory at its
+///   own addresses. Note the order: CR3 is loaded *before*
+///   `context_switch`, while still executing on the outgoing task's
+///   kernel stack. That is safe precisely because every address space
+///   maps the kernel identically in its higher half - the stack under the
+///   CPU's feet does not move when CR3 changes. It is the single property
+///   the whole higher-half split was built to provide.
+///
+/// # Safety
+/// Must be called with interrupts disabled and the scheduler lock
+/// released - see `yield_inner` and `preempt` for why each of those is
+/// required. `switch` must have come from `plan_switch`.
+unsafe fn perform_switch(switch: Switch) {
+    // Safety: `next_kernel_stack_top` is the top of a `mm::kstack` slot
+    // owned by a task that is now `current`, so it stays mapped until
+    // that task is switched away from - exactly the lifetime this
+    // requires.
+    unsafe {
+        crate::arch::x86_64::gdt::set_privilege_stack(VirtAddr::new(switch.next_kernel_stack_top));
+    }
+
+    if let Some(root) = switch.next_address_space {
+        // Safety: `root` is the PML4 of an address space owned by a live
+        // process (dropped only after its task exits, which cannot happen
+        // while it is being switched *to*), and its higher half was
+        // copied from the kernel's, so kernel code and this stack remain
+        // mapped across the write.
+        unsafe {
+            crate::mm::address_space::restore(root);
+        }
+    } else {
+        // A pure kernel task. Returning to the kernel's own address space
+        // rather than inheriting the outgoing process's is deliberate: a
+        // kernel task has no business having a user-mapped lower half
+        // visible to it, and leaving one loaded would mean a stray
+        // lower-half pointer dereference reads a process's memory instead
+        // of faulting.
+        //
+        // Safety: the kernel root is recorded at boot and is live for the
+        // machine's lifetime.
+        unsafe {
+            crate::mm::address_space::restore(crate::mm::address_space::kernel_root());
+        }
+    }
+
+    // Safety: both pointers come from `plan_switch`, which only produces
+    // them from heap-stable `Box<Task>` allocations it has just placed in
+    // the scheduler.
+    unsafe {
+        context_switch(switch.current_stack_out, switch.next_stack);
+    }
+}
+
+/// A pointer to the current task's Ring 3 resume slot, or to the boot
+/// context's if no task is running.
+///
+/// `usermode` needs somewhere per-context to record where to return when
+/// a Ring 3 program ends, and it is reached from a fault handler that has
+/// no way to be handed a reference. It used to be a single global, which
+/// was correct while Ring 3 code only ever ran from the boot path and
+/// could not nest. Once a process is a task, two tasks can each be inside
+/// a Ring 3 program at the same time, and one global slot would have the
+/// second program's fault return into the first program's stack frame.
+///
+/// The boot-context fallback is not a special case bolted on: the boot
+/// path genuinely is a context that runs Ring 3 programs (the usermode
+/// and NX self-tests) and genuinely has no `Task`.
+pub fn supervisor_slot() -> *mut u64 {
+    static BOOT_SUPERVISOR_RSP: spin::Mutex<u64> = spin::Mutex::new(0);
+
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut scheduler = SCHEDULER.lock();
+        match scheduler.current.as_mut() {
+            // Heap-stable per the `Box<Task>` reasoning in `Scheduler`:
+            // the pointer stays valid across the queue operations that
+            // happen while a Ring 3 program runs.
+            Some(task) => &mut task.supervisor_rsp as *mut u64,
+            None => {
+                // `BOOT_SUPERVISOR_RSP`'s address, not the guard's - the
+                // static outlives every borrow of it.
+                let guard = BOOT_SUPERVISOR_RSP.lock();
+                let ptr = &*guard as *const u64 as *mut u64;
+                drop(guard);
+                ptr
+            }
+        }
+    })
+}
+
+/// Whether the current task has an address space of its own, and
+/// therefore whether a Ring 3 program running on it can be preempted.
+pub fn current_task_owns_kernel_stack() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| SCHEDULER.lock().current.is_some())
 }
 
 /// Ends the calling task permanently and switches to whatever runs next.
@@ -631,7 +829,7 @@ pub fn exit_task() -> ! {
     // into a task that has not started running.
     x86_64::instructions::interrupts::disable();
 
-    let (next_stack, reaped) = {
+    let (next_stack, next_kernel_stack_top, next_address_space, reaped) = {
         let mut scheduler = SCHEDULER.lock();
 
         let dying = scheduler
@@ -647,14 +845,24 @@ pub fn exit_task() -> ! {
         match scheduler.ready_queue.pop_front() {
             Some(next) => {
                 let next_stack = next.stack_pointer;
+                let top = next.kernel_rsp0();
+                let space = next.address_space_root;
                 scheduler.current = Some(next);
-                (next_stack, reaped)
+                (next_stack, top, space, reaped)
             }
             None => {
                 // The last task just ended. Return to the boot context if
                 // one is waiting (`run_until_idle`), otherwise there is
-                // nowhere to go.
-                (scheduler.boot_stack_pointer, reaped)
+                // nowhere to go. The boot context has no task and
+                // therefore no per-task kernel stack, so RSP0 goes back
+                // to the fixed stack `gdt::init` installed - the same one
+                // it had before the scheduler ever ran.
+                (
+                    scheduler.boot_stack_pointer,
+                    crate::arch::x86_64::gdt::boot_privilege_stack().as_u64(),
+                    None,
+                    reaped,
+                )
             }
         }
     };
@@ -678,12 +886,27 @@ pub fn exit_task() -> ! {
     // until after the switch completes), so the write is in-bounds.
     let mut discarded: u64 = 0;
 
-    // Safety: `next_stack` is either a `Task` the line above placed into
-    // `scheduler.current` or the boot stack pointer `run_until_idle`
-    // saved - both are exactly what `context_switch`'s contract requires.
-    // `discarded` is a valid local to write through.
+    // The same RSP0 and CR3 updates every other switch does. Leaving them
+    // out here would be a subtle and nasty bug: the *last* switch a task
+    // ever makes would hand the CPU to its successor while RSP0 still
+    // pointed at the dying task's kernel stack (about to be reused for a
+    // new task) and CR3 still held the dying process's page tables (about
+    // to be freed). Everything would keep working until the successor
+    // took its first interrupt from Ring 3.
+    //
+    // Safety: `next_kernel_stack_top` is either a live task's stack or
+    // the boot stack, and `next_address_space` is a live process's PML4
+    // or `None`; `next_stack` came from a `Task` just made current, or is
+    // the boot context's saved pointer. `discarded` is a local on this
+    // task's own stack, which is still mapped - the task is the zombie
+    // now, and nothing frees a zombie until after the switch completes.
     unsafe {
-        context_switch(&mut discarded, next_stack);
+        perform_switch(Switch {
+            current_stack_out: &mut discarded,
+            next_stack,
+            next_kernel_stack_top,
+            next_address_space,
+        });
     }
 
     unreachable!("a task resumed after exit_task() switched away from it");
@@ -762,11 +985,25 @@ pub fn run_until_idle() {
     // - the field is only ever read by `exit_task`, which cannot run
     // until after this write has happened.
     unsafe {
-        let boot_slot = {
+        let (boot_slot, switch) = {
             let mut scheduler = SCHEDULER.lock();
-            &mut scheduler.boot_stack_pointer as *mut u64
+            let boot_slot = &mut scheduler.boot_stack_pointer as *mut u64;
+            let current = scheduler
+                .current
+                .as_ref()
+                .expect("run_until_idle set current above");
+            (
+                boot_slot,
+                Switch {
+                    current_stack_out: boot_slot,
+                    next_stack,
+                    next_kernel_stack_top: current.kernel_rsp0(),
+                    next_address_space: current.address_space_root,
+                },
+            )
         };
-        context_switch(boot_slot, next_stack);
+        let _ = boot_slot;
+        perform_switch(switch);
     }
 
     // Reached only when the last task called `exit_task`.

@@ -14,6 +14,7 @@
 //! own separate stack via the IST is what turns "the machine silently
 //! reboots" into "the machine tells you exactly what went wrong."
 
+use core::sync::atomic::{AtomicPtr, Ordering};
 use lazy_static::lazy_static;
 use x86_64::instructions::segmentation::{Segment, CS, SS};
 use x86_64::instructions::tables::load_tss;
@@ -160,11 +161,107 @@ pub fn user_data_selector() -> SegmentSelector {
     GDT.1.user_data_selector
 }
 
+/// A pointer to the live TSS, so `set_privilege_stack` can rewrite RSP0
+/// after the table has been loaded.
+///
+/// This is what makes Ring 3 preemption possible. RSP0 is the stack the
+/// CPU switches to on *any* Ring 3 -> Ring 0 transition, and while it was
+/// a single fixed buffer, every user program's interrupt frame landed on
+/// the *same* stack. Parking a Ring 3 program by switching RSP would then
+/// strand its frame on a stack the next Ring 3 entry immediately reuses
+/// and overwrites - which is precisely why
+/// `interrupts::timer_interrupt_handler` refused to preempt anything
+/// running at Ring 3.
+///
+/// Pointing RSP0 at *the currently scheduled task's own kernel stack*
+/// removes that restriction entirely: the frame lands on memory the task
+/// owns, so switching away parks it with everything else and switching
+/// back finds it intact. The scheduler updates this on every switch (see
+/// `sched::task::plan_switch`).
+///
+/// An `AtomicPtr` rather than a `Mutex` because the update happens inside
+/// the scheduler's switch path, where taking a lock that an interrupt
+/// handler might also want is exactly the deadlock this kernel spends so
+/// much effort avoiding.
+static TSS_PTR: AtomicPtr<TaskStateSegment> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Points RSP0 at `stack_top` for the next Ring 3 -> Ring 0 transition.
+///
+/// Safe to call while the TSS is loaded: the CPU re-reads RSP0 at each
+/// privilege change rather than caching it, which is the entire reason
+/// this technique works.
+///
+/// # Safety
+/// `stack_top` must be the top of a valid, mapped, writable kernel stack
+/// that will remain valid for as long as the task it belongs to can be
+/// interrupted - i.e. until that task is switched away from. Pointing it
+/// at freed or unmapped memory turns the next syscall or interrupt from
+/// Ring 3 into a double fault.
+pub unsafe fn set_privilege_stack(stack_top: VirtAddr) {
+    let tss = TSS_PTR.load(Ordering::SeqCst);
+    assert!(
+        !tss.is_null(),
+        "set_privilege_stack called before gdt::init"
+    );
+    // Safety: `tss` is the address of the `TSS` static below, recorded by
+    // `init`. Writing RSP0 while the TSS is loaded is architecturally
+    // defined - the CPU reads the field at each privilege transition.
+    // Forwarded from this function's own contract for the value written.
+    unsafe {
+        (*tss).privilege_stack_table[0] = stack_top;
+    }
+}
+
+/// A raw pointer to the TSS's RSP0 field.
+///
+/// Needed because the exact right moment to set RSP0 is *inside*
+/// `usermode::enter_usermode_and_wait`, between saving the Ring 0 context
+/// and executing `iretq` - see the extended discussion there. That is
+/// hand-written assembly, so it needs an address to store through rather
+/// than a function to call.
+///
+/// `VirtAddr` is `#[repr(transparent)]` over `u64`, so a `*mut u64` at
+/// this address writes exactly the field.
+pub fn privilege_stack_ptr() -> *mut u64 {
+    let tss = TSS_PTR.load(Ordering::SeqCst);
+    assert!(
+        !tss.is_null(),
+        "privilege_stack_ptr called before gdt::init"
+    );
+    // Safety: `tss` is the address of the `TSS` static, recorded by
+    // `init`. Forming a pointer to one of its fields is not a
+    // dereference; the write through it happens in assembly whose own
+    // safety argument is documented at the call site.
+    unsafe { core::ptr::addr_of_mut!((*tss).privilege_stack_table[0]) as *mut u64 }
+}
+
+/// The RSP0 value the kernel starts with, before any task owns it.
+///
+/// Kept so that a context with no task of its own - the boot path, which
+/// runs the Ring 3 self-tests before the scheduler exists - has a valid
+/// stack to fall back to.
+pub fn boot_privilege_stack() -> VirtAddr {
+    BOOT_PRIVILEGE_STACK
+        .get()
+        .copied()
+        .expect("boot_privilege_stack read before gdt::init")
+}
+
+static BOOT_PRIVILEGE_STACK: spin::Once<VirtAddr> = spin::Once::new();
+
 /// Installs this kernel's own GDT and TSS, replacing the minimal one the
 /// bootloader used just to get into long mode. Must run before
 /// `interrupts::init()` - the double fault handler's IST index only means
 /// anything once this TSS is actually loaded into the CPU.
 pub fn init() {
+    // Recorded before the table is loaded, so `set_privilege_stack` is
+    // usable from the moment anything could need it. `&*TSS` forces
+    // lazy_static's one-time initialization first, so the pointer is to
+    // the fully-constructed value rather than to an uninitialized cell.
+    let tss: &TaskStateSegment = &TSS;
+    TSS_PTR.store(tss as *const TaskStateSegment as *mut TaskStateSegment, Ordering::SeqCst);
+    BOOT_PRIVILEGE_STACK.call_once(|| tss.privilege_stack_table[0]);
+
     GDT.0.load();
     unsafe {
         // Safety: `code_selector`, `data_selector`, and `tss_selector` are

@@ -142,6 +142,15 @@ pub fn uptime_ms() -> u64 {
     timer_ticks() * 1000 / TIMER_HZ
 }
 
+/// How many times the timer has taken the CPU away from a program running
+/// at Ring 3. See the increment site in `timer_interrupt_handler`.
+static RING3_PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// How many Ring 3 programs have been preempted since boot.
+pub fn ring3_preemptions() -> u64 {
+    RING3_PREEMPTIONS.load(Ordering::Relaxed)
+}
+
 /// Current tick count. `Relaxed` ordering is sufficient: this is a
 /// monotonically increasing counter with no other memory operations that
 /// need to be ordered relative to it, not a synchronization primitive.
@@ -484,9 +493,11 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
 
-    // Preemption, but only for an interrupt taken while already in Ring
-    // 0. That restriction is the whole safety argument for switching
-    // tasks from inside an `extern "x86-interrupt"` handler at all:
+    // Preemption. Both Ring 0 and Ring 3 now, which is the change this
+    // milestone is really about - ARCHITECTURE.md section 4 recorded the
+    // Ring 3 restriction as a real gap, and this is what closes it.
+    //
+    // The old reasoning, and what changed:
     //
     // - **Ring 0 -> Ring 0** (a kernel task was interrupted): the CPU
     //   does not switch stacks, so the interrupt frame and every register
@@ -499,20 +510,37 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     //   frame-rewriting technique a stackless design would.
     //
     // - **Ring 3 -> Ring 0** (a user program was interrupted): the CPU
-    //   *does* switch stacks, to the single shared TSS RSP0 stack. That
-    //   frame does not belong to any task's stack, so parking it by
-    //   switching RSP would strand it on a stack the next Ring 3 entry
-    //   will reuse and overwrite. Preempting a Ring 3 program needs its
-    //   register state saved somewhere it owns, which is per-program
-    //   context this kernel does not have yet - so it is explicitly not
-    //   attempted rather than approximated.
+    //   *does* switch stacks, to the stack named by TSS RSP0. This used
+    //   to be a single shared buffer, which is what made preemption
+    //   unsafe: the frame did not belong to any task, so parking it by
+    //   switching RSP would strand it on memory the next Ring 3 entry
+    //   immediately reused and overwrote.
     //
-    // The practical effect today is nil: Ring 3 programs only run from
-    // `kernel_main` before the scheduler starts. It is checked anyway
-    // because "nothing currently reaches this case" is a property of
-    // today's `kernel_main`, not of this handler, and the failure mode if
-    // that changes is silent stack corruption.
-    if stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring0 {
+    //   RSP0 now points at *the currently scheduled task's own kernel
+    //   stack*, updated on every switch by `sched::task::perform_switch`.
+    //   The interrupt frame therefore lands on memory that task owns, and
+    //   parking it is exactly as safe as the Ring 0 case above - the
+    //   frame goes to sleep with the rest of the task's stack and is
+    //   found intact on resume.
+    //
+    // The one remaining precondition is that a task actually be current.
+    // A Ring 3 program launched from the boot path (the usermode and NX
+    // self-tests) runs before the scheduler owns the CPU, and RSP0 is
+    // still the boot stack then - shared, exactly as before. Preempting
+    // in that state would reintroduce the original bug, so it is checked
+    // rather than assumed.
+    let interrupted_ring3 = stack_frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3;
+    if !interrupted_ring3 || crate::sched::task::current_task_owns_kernel_stack() {
+        if interrupted_ring3 {
+            // Counted so the boot self-tests can *prove* Ring 3
+            // preemption happened rather than infer it from output
+            // ordering. Without this the claim rests on a human noticing
+            // that `[userland]` and `[Task A]` lines interleave, which is
+            // real evidence but not checkable evidence - and a kernel
+            // that quietly stopped preempting Ring 3 would still produce
+            // a plausible-looking log.
+            RING3_PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
+        }
         crate::sched::task::preempt();
     }
 }

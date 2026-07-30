@@ -18,10 +18,10 @@
 //! check below is x86_64-specific, and everything else here would look
 //! identical on a future `arch::aarch64`.
 
-use crate::arch::x86_64::usermode::ProgramExit;
+use crate::mm::address_space::AddressSpace;
 use crate::serial_println;
 use alloc::collections::BTreeSet;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
@@ -127,135 +127,63 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-/// Parses the ELF64 binary in `bytes`, maps its `PT_LOAD` segments as
-/// user-accessible pages, transitions to Ring 3 at its entry point, and
-/// reports how the program ended.
+// `load_and_run` and its `load` helper used to live here: they mapped an
+// image into whatever address space was currently active and ran it
+// inline. They are gone, replaced by `load_image` above plus
+// `process::spawn`.
+//
+// The reason is not tidiness. Mapping into the *active* address space is
+// correct only while exactly one program can exist, and it made three
+// things impossible at once: two programs could not be loaded (both link
+// to 0x400000, so the second `map_to` failed), a program could not be
+// preempted (it was running on `kernel_main`'s stack, not a task's), and
+// its memory could never be reclaimed (nothing recorded which of the
+// shared address space's mappings had been its). Keeping the old path
+// alongside the new one would have meant maintaining a second, weaker
+// way to run a program, whose only distinguishing feature was the
+// limitations.
+
+/// Parses an ELF64 image and builds a complete, private address space for
+/// it, ready to be handed to `process::spawn`.
 ///
-/// Returns rather than diverging: `arch::x86_64::usermode::run_program`,
-/// which this calls as its final step, gained a way back for both a
-/// clean exit and a fault. Note that a returned
-/// `ProgramExit::PageFault`/`GeneralProtectionFault` means the *program*
-/// was terminated, not that loading failed - a malformed ELF still fails
-/// loudly through the assertions above, before Ring 3 is ever reached.
-pub fn load_and_run(bytes: &[u8]) -> ProgramExit {
-    // Mapping and running are deliberately separated, and the page-table
-    // lock is released between them. Holding it across `run_program`
-    // would be a guaranteed deadlock: the program's very first syscall
-    // reaches a handler that needs to touch memory, and the lock is
-    // non-reentrant.
-    let (entry, stack_top) = crate::mm::memory::with_memory(|mapper, frame_allocator| {
-        load(bytes, mapper, frame_allocator)
-    });
-
-    serial_println!("Najm Kernel: ELF loaded, entering Ring 3 at {:#x}", entry);
-
-    // Safety: `entry` falls within a PT_LOAD segment `load` just mapped
-    // executable and user-accessible; `stack_top` sits at the top of the
-    // equally-mapped stack it also created.
-    unsafe { crate::arch::x86_64::usermode::run_program(entry, stack_top) }
-}
-
-/// Parses and maps the program, returning `(entry point, stack top)`.
+/// The single entry point for turning a file into something runnable. It
+/// does four things, in this order, and the order matters:
 ///
-/// Split out of `load_and_run` so that the mapping work can happen inside
-/// a `with_memory` block while the Ring 3 transition happens outside one.
-fn load(
-    bytes: &[u8],
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> (u64, u64) {
-    assert!(
-        bytes.len() >= 64,
-        "ramdisk is too small to contain an ELF64 header"
-    );
-    assert_eq!(
-        &bytes[0..4],
-        &ELF_MAGIC,
-        "ramdisk does not start with the ELF magic number"
-    );
-    assert_eq!(bytes[4], ELFCLASS64, "only 64-bit ELF binaries are supported");
-    assert_eq!(
-        bytes[5], ELFDATA2LSB,
-        "only little-endian ELF binaries are supported"
-    );
-
-    let e_type = read_u16(bytes, 16);
-    let e_machine = read_u16(bytes, 18);
-    let e_entry = read_u64(bytes, 24);
-    let e_phoff = read_u64(bytes, 32) as usize;
-    let e_phentsize = read_u16(bytes, 54) as usize;
-    let e_phnum = read_u16(bytes, 56) as usize;
-
-    assert_eq!(
-        e_type, ET_EXEC,
-        "only ET_EXEC (fixed-address) binaries are supported - no PIE/dynamic linking yet"
-    );
-    assert_eq!(e_machine, EM_X86_64, "ELF machine type is not x86_64");
-
-    // Validates the *entire* program header table is in-bounds up front,
-    // rather than discovering a truncated or malicious `e_phoff`/
-    // `e_phnum` one field-read at a time inside the loop below. Without
-    // this, a malformed ELF (accidentally corrupt, not necessarily
-    // hostile - this loader was never meant to be pointed at untrusted
-    // input, see the module docs) would panic on a raw slice-index
-    // out-of-bounds deep inside `read_u32`/`read_u64`, which is correct
-    // in the sense that it doesn't read past the buffer, but unhelpful
-    // as a diagnostic and needlessly fragile as a contract: callers of
-    // `load_and_run` deserve one clear assertion message, not an
-    // internal index-panic that happens to be safe by accident.
-    let phdr_table_size = e_phnum
-        .checked_mul(e_phentsize)
-        .expect("ELF program header table size overflows usize");
-    let phdr_table_end = e_phoff
-        .checked_add(phdr_table_size)
-        .expect("ELF program header table offset overflows usize");
-    assert!(
-        phdr_table_end <= bytes.len(),
-        "ELF program header table extends past the end of the ramdisk"
-    );
-
-    serial_println!(
-        "Najm Kernel: ELF parsed - entry point {:#x}, {} program header(s)",
-        e_entry,
-        e_phnum
-    );
-
+/// 1. Validate the header *completely* before reading any segment, so a
+///    truncated or hostile file produces one clear error rather than an
+///    out-of-bounds slice index deep inside a field read.
+/// 2. Build a fresh `AddressSpace`, so the image's fixed load address
+///    (`0x400000` - the loader supports only `ET_EXEC`) cannot collide
+///    with any other process's.
+/// 3. Map each segment writable, zero the whole mapped range, copy the
+///    file contents in, then tighten the permissions to what the segment
+///    declared. Zeroing before copying is not optional: fresh frames come
+///    from the pool holding whatever the previous owner left in them.
+/// 4. Map a stack, non-executable, with an unmapped guard page below.
+pub fn load_image(bytes: &[u8], name: &str) -> Result<crate::process::LoadedImage, LoadError> {
+    let header = parse_header(bytes)?;
+    let mut space = AddressSpace::new().ok_or(LoadError::OutOfMemory)?;
     let nx_available = crate::arch::x86_64::cpu::detect().nx;
 
-    // Every page mapped so far by this load, so that two segments sharing
-    // a page are detected as the conflict they are rather than failing
-    // deep inside `map_to` with "already mapped".
-    //
-    // Sharing a page is not merely awkward, it is a W^X hole: if a
-    // read-execute segment and a read-write segment overlap in one page,
-    // that page has to be both, and whichever mapping wins silently
-    // grants the other segment permissions it never asked for. The fix
-    // belongs in the linker script (page-align the segments), so this
-    // reports rather than papering over it.
+    serial_println!(
+        "Najm Kernel: loading '{}' into a private address space - entry {:#x}, {} program \
+         header(s)",
+        name,
+        header.entry,
+        header.phnum
+    );
+
+    // Every page mapped so far by this load. Two segments sharing a page
+    // is not merely awkward, it is a W^X hole: permissions are a property
+    // of a page, so an r-x segment and an rw- segment overlapping in one
+    // page means whichever mapping wins silently grants the other
+    // permissions it never asked for. The fix belongs in the linker
+    // script; this reports rather than papering over it.
     let mut mapped_pages: BTreeSet<u64> = BTreeSet::new();
 
-    // Segments are mapped writable, filled in, and only then re-protected
-    // to their real permissions. That two-step is forced by CR0.WP, which
-    // this kernel now sets: with write protection on, Ring 0 cannot write
-    // to a read-only page any more than Ring 3 can, so a code segment
-    // mapped read-execute up front would be unwritable at the moment the
-    // loader needs to put the code in it. Mapping writable and then
-    // tightening is the standard resolution, and the window is entirely
-    // inside this function - no user code runs during it.
-    let mut segments_to_protect: alloc::vec::Vec<(Page<Size4KiB>, Page<Size4KiB>, PageTableFlags)> =
-        alloc::vec::Vec::new();
-
-    let load_flags =
-        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
-    for i in 0..e_phnum {
-        // Safe from overflow: `phdr_table_end` above already validated
-        // `e_phoff + e_phnum * e_phentsize` fits in `bytes.len()`, and
-        // `i` only ranges over `0..e_phnum`, so this per-entry offset is
-        // always strictly less than that already-checked total.
-        let ph_offset = e_phoff + i * e_phentsize;
-        let p_type = read_u32(bytes, ph_offset);
-        if p_type != PT_LOAD {
+    for i in 0..header.phnum {
+        let ph_offset = header.phoff + i * header.phentsize;
+        if read_u32(bytes, ph_offset) != PT_LOAD {
             continue;
         }
 
@@ -265,17 +193,113 @@ fn load(
         let p_filesz = read_u64(bytes, ph_offset + 32) as usize;
         let p_memsz = read_u64(bytes, ph_offset + 40) as usize;
 
-        let final_flags = match segment_flags(p_flags, nx_available) {
-            Ok(flags) => flags,
-            Err(reason) => panic!(
-                "refusing to load ELF segment {} at {:#x} with flags {:#x}: {}",
-                i, p_vaddr, p_flags, reason
-            ),
-        };
+        let final_flags =
+            segment_flags(p_flags, nx_available).map_err(|reason| LoadError::BadSegment {
+                index: i,
+                vaddr: p_vaddr,
+                reason,
+            })?;
+
+        // A user program must never be able to name a kernel address in
+        // its own program headers. Without this check, a hand-crafted ELF
+        // with `p_vaddr` in the higher half would have the loader map
+        // user-accessible pages over the kernel's own - which is not an
+        // exploit needing a bug, just a file the loader was asked to
+        // open. `AddressSpace::map_page` refuses it too; both checks
+        // exist because this one produces a diagnosable error naming the
+        // segment, and that one is the last line of defence.
+        if !crate::mm::layout::is_user_address(p_vaddr) {
+            return Err(LoadError::BadSegment {
+                index: i,
+                vaddr: p_vaddr,
+                reason: "load address is outside user space",
+            });
+        }
+        if p_filesz > p_memsz {
+            return Err(LoadError::BadSegment {
+                index: i,
+                vaddr: p_vaddr,
+                reason: "file size exceeds memory size",
+            });
+        }
+        let file_end = p_offset.checked_add(p_filesz).ok_or(LoadError::BadSegment {
+            index: i,
+            vaddr: p_vaddr,
+            reason: "file offset + size overflows",
+        })?;
+        if file_end > bytes.len() {
+            return Err(LoadError::BadSegment {
+                index: i,
+                vaddr: p_vaddr,
+                reason: "segment extends past the end of the image",
+            });
+        }
+        // Overflowing here would wrap `end_page` to a *smaller* address
+        // than `start_page`, under-mapping the segment while the copy
+        // below still used the original size - an out-of-bounds write
+        // onto whatever sat after the truncated mapping.
+        let segment_end = p_vaddr
+            .checked_add(p_memsz as u64)
+            .ok_or(LoadError::BadSegment {
+                index: i,
+                vaddr: p_vaddr,
+                reason: "vaddr + memsz overflows",
+            })?;
+        if p_memsz == 0 {
+            continue;
+        }
+
+        let start_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(p_vaddr));
+        let end_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(segment_end - 1));
+
+        // Mapped writable first and tightened after the contents are in.
+        // Forced by CR0.WP: with write protection on, Ring 0 cannot write
+        // to a read-only page either, so a code segment mapped
+        // read-execute up front would be unwritable at exactly the moment
+        // the loader needs to put code in it.
+        let load_flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+        for page in Page::range_inclusive(start_page, end_page) {
+            if !mapped_pages.insert(page.start_address().as_u64()) {
+                return Err(LoadError::BadSegment {
+                    index: i,
+                    vaddr: page.start_address().as_u64(),
+                    reason: "two segments share a page, so they cannot have different \
+                             permissions - page-align them in the linker script",
+                });
+            }
+            space.map_page(page, load_flags).map_err(LoadError::Mapping)?;
+        }
+
+        // Zero the whole mapped range *before* copying anything into it.
+        //
+        // Not just the `.bss` tail. Fresh frames come from the physical
+        // frame pool still holding whatever the last owner left there -
+        // kernel memory, or another process's. Zeroing only the declared
+        // `.bss` would leave the page padding either side of a segment
+        // carrying that data straight into Ring 3: an information leak
+        // through a gap that belongs to no segment and that nobody would
+        // think to look at.
+        let mapped_start = start_page.start_address().as_u64();
+        let mapped_len = (end_page.start_address().as_u64() + 4096 - mapped_start) as usize;
+        space
+            .zero_at(mapped_start, mapped_len)
+            .map_err(LoadError::Mapping)?;
+
+        space
+            .write_at(p_vaddr, &bytes[p_offset..file_end])
+            .map_err(LoadError::Mapping)?;
+
+        for page in Page::range_inclusive(start_page, end_page) {
+            space
+                .protect_page(page, final_flags)
+                .map_err(LoadError::Mapping)?;
+        }
 
         serial_println!(
-            "Najm Kernel: mapping PT_LOAD segment - vaddr {:#x}, file size {}, mem size {}, \
-             permissions {}{}{}",
+            "Najm Kernel:   segment {} - vaddr {:#x}, {} bytes ({} in memory), permissions {}{}{}",
+            i,
             p_vaddr,
             p_filesz,
             p_memsz,
@@ -283,180 +307,138 @@ fn load(
             if p_flags & PF_W != 0 { "w" } else { "-" },
             if p_flags & PF_X != 0 { "x" } else { "-" }
         );
-
-        // A user program must never be able to name a kernel address in
-        // its own program headers. Without this, a hand-crafted ELF with
-        // `p_vaddr` in the higher half would have the loader map
-        // user-accessible pages *over the kernel's own mappings* - which
-        // is not an exploit needing a bug, just a file the loader was
-        // asked to open.
-        assert!(
-            crate::mm::layout::is_user_address(p_vaddr),
-            "ELF segment {} declares a load address ({:#x}) outside user space",
-            i,
-            p_vaddr
-        );
-
-        assert!(
-            p_filesz <= p_memsz,
-            "malformed ELF: a segment's file size exceeds its memory size"
-        );
-        assert!(
-            p_offset
-                .checked_add(p_filesz)
-                .expect("ELF segment file offset + size overflows usize")
-                <= bytes.len(),
-            "ELF segment file range extends past the end of the ramdisk"
-        );
-        // `p_vaddr + p_memsz` overflowing would otherwise silently wrap
-        // `end_page` below to a *smaller* address than `start_page`,
-        // under-mapping the segment while the zero-fill/copy further
-        // down still uses the original, un-wrapped `p_memsz` - an
-        // out-of-bounds write onto whatever memory happens to sit right
-        // after the truncated mapping. Rejecting the overflow outright
-        // is cheap insurance against a malformed segment size class of
-        // bug that would otherwise be very hard to notice from the
-        // symptom alone.
-        let segment_end = p_vaddr
-            .checked_add(p_memsz as u64)
-            .expect("ELF segment vaddr + mem size overflows u64");
-
-        let start_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(p_vaddr));
-        let end_page: Page<Size4KiB> =
-            Page::containing_address(VirtAddr::new(segment_end - 1));
-
-        for page in Page::range_inclusive(start_page, end_page) {
-            assert!(
-                mapped_pages.insert(page.start_address().as_u64()),
-                "ELF segments overlap on the page at {:#x}. Two segments sharing a page cannot \
-                 have different permissions, so one would silently inherit the other's - page-align \
-                 the segments in the linker script.",
-                page.start_address().as_u64()
-            );
-
-            let frame = frame_allocator
-                .allocate_frame()
-                .expect("out of physical frames while mapping an ELF segment");
-
-            // Safety: `frame` just came from `frame_allocator`, which
-            // only hands out frames from bootloader-reported usable
-            // regions and never repeats one. `page` is derived directly
-            // from this segment's own declared virtual address range,
-            // which was checked to be a user address above.
-            unsafe {
-                mapper
-                    .map_to(page, frame, load_flags, frame_allocator)
-                    .expect("failed to map an ELF segment page")
-                    .flush();
-            }
-        }
-
-        // Safety: every byte of the destination range was just mapped
-        // PRESENT | WRITABLE in the loop immediately above. The source
-        // range was validated against `bytes.len()` above too. The
-        // destination is user-accessible memory, so the write goes inside
-        // a `with_user_access` bracket - required once SMAP is on, and a
-        // no-op otherwise.
-        crate::arch::x86_64::cpu::with_user_access(|| unsafe {
-            core::ptr::copy_nonoverlapping(
-                bytes.as_ptr().add(p_offset),
-                p_vaddr as *mut u8,
-                p_filesz,
-            );
-
-            // Zero-fill the remainder - `p_memsz > p_filesz` is how ELF
-            // represents `.bss`: uninitialized data that isn't stored in
-            // the file at all, only reserved as address space. Note this
-            // is not merely about giving the program zeroes: without it
-            // the program would read whatever the frame allocator handed
-            // over last, which is stale kernel data, i.e. an information
-            // leak straight into Ring 3.
-            if p_memsz > p_filesz {
-                core::ptr::write_bytes((p_vaddr as *mut u8).add(p_filesz), 0, p_memsz - p_filesz);
-            }
-        });
-
-        // Deferred rather than applied now: the segment has to stay
-        // writable until every byte of it has been written, and a segment
-        // may be filled in more than one step above.
-        if final_flags != load_flags {
-            segments_to_protect.push((start_page, end_page, final_flags));
-        }
     }
 
-    // Apply the real permissions. From this point the program's code is
-    // read-execute and its data is read-write-no-execute, which is what
-    // makes W^X a property of the running program rather than a claim in
-    // a comment.
-    for (start_page, end_page, flags) in segments_to_protect {
-        for page in Page::range_inclusive(start_page, end_page) {
-            // Safety: `page` was mapped by the loop above and is still
-            // mapped; `update_flags` only changes permission bits on an
-            // existing mapping and cannot make it point elsewhere.
-            unsafe {
-                mapper
-                    .update_flags(page, flags)
-                    .expect("failed to re-protect an ELF segment page")
-                    .flush();
-            }
-        }
-    }
-
-    // A dedicated user stack, entirely separate from any PT_LOAD segment
-    // - the same approach `usermode::run_test` already proved works.
-    //
-    // Mapped NO_EXECUTE. A stack is the single most valuable page in the
-    // address space to an attacker who can only write data: it is where
-    // return addresses live, it is where overflowing buffers usually are,
-    // and if it is executable then "overwrite a local array" and "run
-    // arbitrary code" are the same operation. The `NO_EXECUTE` bit is
-    // what separates them.
-    //
-    // Below it, `layout::USER_STACK_GUARD` is deliberately left unmapped.
-    // A program that overflows its stack faults on that page instead of
-    // silently corrupting whatever happens to be mapped underneath -
-    // which, before this, was nothing in particular, making a stack
-    // overflow present as a page fault at an unrelated address with no
-    // hint of the real cause.
+    // The stack: writable, never executable. `layout::USER_STACK_GUARD`
+    // sits immediately below and is simply never mapped by this loop -
+    // its protection is its absence, so there is nothing here to create.
     let mut stack_flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     if nx_available {
         stack_flags |= PageTableFlags::NO_EXECUTE;
     }
-
     for i in 0..USER_STACK_PAGES {
-        let stack_page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(
-            USER_STACK_ADDR + i * Page::<Size4KiB>::SIZE,
-        ));
-        let frame = frame_allocator
-            .allocate_frame()
-            .expect("out of physical frames while mapping the ELF program's stack");
-        // Safety: same reasoning as the segment-mapping loop above.
-        unsafe {
-            mapper
-                .map_to(stack_page, frame, stack_flags, frame_allocator)
-                .expect("failed to map the ELF program's stack")
-                .flush();
+        let page: Page<Size4KiB> =
+            Page::containing_address(VirtAddr::new(USER_STACK_ADDR + i * 4096));
+        space.map_page(page, stack_flags).map_err(LoadError::Mapping)?;
+    }
+    // Same reasoning as the segment zeroing: a stack handed to a process
+    // must not start out holding whoever used those frames last.
+    space
+        .zero_at(USER_STACK_ADDR, (USER_STACK_PAGES * 4096) as usize)
+        .map_err(LoadError::Mapping)?;
+
+    Ok(crate::process::LoadedImage {
+        name: alloc::string::String::from(name),
+        entry: header.entry,
+        stack_top: USER_STACK_ADDR + USER_STACK_PAGES * 4096,
+        address_space: space,
+    })
+}
+
+/// Why building an image's address space failed.
+///
+/// An error type rather than the assertions the previous loader used,
+/// because this function is on the path a `spawn` syscall will take: a
+/// malformed program file must be an error a caller can report, never a
+/// kernel panic. A panic here would mean any user able to name a corrupt
+/// file could halt the machine.
+#[derive(Debug)]
+pub enum LoadError {
+    NotAnElf(&'static str),
+    BadSegment {
+        index: usize,
+        vaddr: u64,
+        reason: &'static str,
+    },
+    Mapping(crate::mm::address_space::MapError),
+    OutOfMemory,
+}
+
+impl core::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LoadError::NotAnElf(why) => write!(f, "not a loadable ELF64 image: {}", why),
+            LoadError::BadSegment {
+                index,
+                vaddr,
+                reason,
+            } => write!(
+                f,
+                "segment {} at {:#x} is not loadable: {}",
+                index, vaddr, reason
+            ),
+            LoadError::Mapping(err) => write!(f, "could not map the image: {}", err),
+            LoadError::OutOfMemory => write!(f, "out of memory building the address space"),
         }
     }
+}
 
-    // Checked rather than assumed. The guard page is "protective" only if
-    // nothing ever maps it, and the way that guarantee dies is quietly -
-    // some future allocator picks the address, everything keeps working,
-    // and the protection is gone with no symptom. One page-table walk at
-    // load time is cheap enough to make that impossible to miss.
-    assert!(
-        !crate::mm::memory::user_range_is_accessible(crate::mm::layout::USER_STACK_GUARD, 4096),
-        "the page below the user stack ({:#x}) is mapped - it must stay unmapped to catch \
-         stack overflow",
-        crate::mm::layout::USER_STACK_GUARD
-    );
+struct ElfHeader {
+    entry: u64,
+    phoff: usize,
+    phentsize: usize,
+    phnum: usize,
+}
 
-    // The stack grows *down* from its top, so the entry value is the
-    // address just past the highest mapped stack page. 16-byte aligned by
-    // construction (a page-aligned base plus a whole number of pages),
-    // which is what the SysV ABI requires at a program's entry point.
-    let stack_top = USER_STACK_ADDR + USER_STACK_PAGES * Page::<Size4KiB>::SIZE;
+/// Validates the ELF header and returns the fields the loader needs.
+///
+/// Every bound is checked here rather than discovered field-by-field
+/// inside the segment loop. A truncated or hostile header would otherwise
+/// produce an out-of-bounds slice index deep inside `read_u64` - correct
+/// in the sense that it does not read past the buffer, but a panic where
+/// an error belongs.
+fn parse_header(bytes: &[u8]) -> Result<ElfHeader, LoadError> {
+    if bytes.len() < 64 {
+        return Err(LoadError::NotAnElf("smaller than an ELF64 header"));
+    }
+    if bytes[0..4] != ELF_MAGIC {
+        return Err(LoadError::NotAnElf("wrong magic number"));
+    }
+    if bytes[4] != ELFCLASS64 {
+        return Err(LoadError::NotAnElf("not 64-bit"));
+    }
+    if bytes[5] != ELFDATA2LSB {
+        return Err(LoadError::NotAnElf("not little-endian"));
+    }
+    if read_u16(bytes, 16) != ET_EXEC {
+        return Err(LoadError::NotAnElf(
+            "not ET_EXEC - PIE and dynamic linking are not supported",
+        ));
+    }
+    if read_u16(bytes, 18) != EM_X86_64 {
+        return Err(LoadError::NotAnElf("not x86_64"));
+    }
 
-    (e_entry, stack_top)
+    let phoff = read_u64(bytes, 32) as usize;
+    let phentsize = read_u16(bytes, 54) as usize;
+    let phnum = read_u16(bytes, 56) as usize;
+
+    // A program header entry smaller than the fields this loader reads
+    // would make every per-segment offset below read into the *next*
+    // entry, or past the table entirely - checked here rather than
+    // trusting `e_phentsize` to be the standard 56.
+    if phentsize < 56 {
+        return Err(LoadError::NotAnElf(
+            "program header entries are too small to contain the fields the loader reads",
+        ));
+    }
+    let table_size = phnum
+        .checked_mul(phentsize)
+        .ok_or(LoadError::NotAnElf("program header table size overflows"))?;
+    let table_end = phoff
+        .checked_add(table_size)
+        .ok_or(LoadError::NotAnElf("program header table offset overflows"))?;
+    if table_end > bytes.len() {
+        return Err(LoadError::NotAnElf(
+            "program header table extends past the end of the image",
+        ));
+    }
+
+    Ok(ElfHeader {
+        entry: read_u64(bytes, 24),
+        phoff,
+        phentsize,
+        phnum,
+    })
 }

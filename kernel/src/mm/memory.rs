@@ -286,6 +286,22 @@ unsafe fn page_is_user_accessible(
     true
 }
 
+/// The bootloader's physical-memory mapping offset.
+///
+/// Exposed because per-address-space page table walks
+/// (`mm::address_space`) need to reach a frame that is not mapped in the
+/// currently active tables, and this window is the only way to do that
+/// without switching CR3 - which would mean the kernel briefly running on
+/// a half-built process's page tables.
+pub fn physical_memory_offset() -> u64 {
+    let offset = PHYSICAL_MEMORY_OFFSET.load(Ordering::SeqCst);
+    assert_ne!(
+        offset, OFFSET_UNINITIALIZED,
+        "physical_memory_offset read before mm::memory::init"
+    );
+    offset
+}
+
 /// The largest single buffer a syscall will copy in or out.
 ///
 /// A limit is required, not merely prudent. `copy_from_user` allocates a
@@ -575,6 +591,16 @@ impl BootInfoFrameAllocator {
 // ever repeated.
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        // Reuse before bumping. This is the one line that makes process
+        // teardown actually return memory to the system rather than
+        // merely stop using it: `AddressSpace::drop` pushes its frames
+        // into `frame_pool`, and every subsequent allocation - from any
+        // caller, without any of them knowing - draws from there first.
+        if let Some(frame) = crate::mm::frame_pool::acquire() {
+            return Some(frame);
+        }
+
+
         // Fix note: the original version of this allocator called
         // `self.usable_frames().nth(self.next)` here, rebuilding and
         // re-walking the *entire* iterator chain over every usable
