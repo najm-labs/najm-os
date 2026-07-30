@@ -56,6 +56,10 @@ pub static PICS: Mutex<ChainedPics> =
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     Keyboard,
+    /// IRQ 12 - the PS/2 auxiliary device, i.e. the mouse. On the
+    /// secondary PIC, which is why its handler has to acknowledge both
+    /// controllers.
+    Mouse = PIC_2_OFFSET + 4,
 }
 
 impl InterruptIndex {
@@ -206,6 +210,7 @@ lazy_static! {
 
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+        idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
 
         // Vector 0x80: a software-interrupt syscall gate, in the classic
         // (pre-`syscall`/`sysret`) style - deliberately the simpler of
@@ -546,47 +551,41 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // pc-keyboard 0.9 splits PS/2 and USB handling into distinct types
-    // (`PS2Keyboard` vs `UsbKeyboard`) where earlier versions had one
-    // generic `Keyboard` type - we're reading raw scancodes off the
-    // legacy PS/2 controller port below, so `PS2Keyboard` is the correct
-    // one, not a naming preference.
-    use pc_keyboard::{layouts, DecodedKey, HandleControl, PS2Keyboard, ScancodeSet1};
-    use x86_64::instructions::port::Port;
+    // The handler does the minimum: take the byte off the port and queue
+    // it. It used to decode the scancode and print the character to
+    // serial, which was the right amount of machinery for proving the IRQ
+    // arrives and no more - the keystroke was consumed by the act of
+    // observing it, so no program could ever receive one.
+    //
+    // Doing less here also matters for latency. An interrupt handler runs
+    // with interrupts disabled and holds up everything on the machine, so
+    // any work it does is charged directly against the Gaming Realm's
+    // scheduling budget. Decoding belongs at Ring 3, not here.
+    crate::drivers::input::on_scancode(crate::drivers::input::read_data_port());
 
-    lazy_static! {
-        static ref KEYBOARD: Mutex<PS2Keyboard<layouts::Us104Key, ScancodeSet1>> =
-            Mutex::new(PS2Keyboard::new(
-                ScancodeSet1::new(),
-                layouts::Us104Key,
-                HandleControl::Ignore
-            ));
-    }
-
-    let mut keyboard = KEYBOARD.lock();
-
-    // Safety: port 0x60 is the standard, fixed PS/2 controller data port
-    // - reading it here, and only here, in response to a keyboard IRQ is
-    // exactly how a PS/2 driver is meant to consume a pending scancode.
-    let scancode: u8 = unsafe {
-        let mut port = Port::new(0x60);
-        port.read()
-    };
-
-    if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
-        if let Some(key) = keyboard.process_keyevent(key_event) {
-            match key {
-                DecodedKey::Unicode(character) => serial_print!("{}", character),
-                DecodedKey::RawKey(key) => serial_print!("{:?}", key),
-            }
-        }
-    }
-
-    // Safety: same reasoning as the timer handler above - this
-    // acknowledges the Keyboard IRQ that's the only reason this function
-    // is ever invoked in the first place.
+    // Safety: this acknowledges the Keyboard IRQ that is the only reason
+    // this function is ever invoked.
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::input::on_mouse_byte(crate::drivers::input::read_data_port());
+
+    // The mouse is on IRQ 12, which is on the *secondary* PIC. Both PICs
+    // have to be acknowledged - the secondary raised the interrupt, and
+    // the primary relayed it through its cascade line. Acknowledging only
+    // one leaves the other believing an interrupt is still in service,
+    // and it stops delivering anything further. `notify_end_of_interrupt`
+    // on the chained pair handles both, which is exactly why the driver
+    // goes through it rather than writing the ports directly.
+    //
+    // Safety: acknowledges the Mouse IRQ that is the only reason this
+    // function is ever invoked.
+    unsafe {
+        PICS.lock()
+            .notify_end_of_interrupt(InterruptIndex::Mouse.as_u8());
     }
 }

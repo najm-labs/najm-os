@@ -353,6 +353,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
     }
 
+    // Device discovery. Everything before this point talks to hardware at
+    // an address fixed by convention - the serial port, the PIT, the PS/2
+    // controller. PCI is the first bus this kernel *asks* rather than
+    // assumes, which is the prerequisite for ARCHITECTURE.md section 6's
+    // driver strategy.
+    serial_println!("Najm Kernel: enumerating the PCI bus");
+    let pci_devices = drivers::pci::init();
+    selftest::check(
+        "PCI enumeration",
+        pci_devices > 0,
+        format_args!(
+            "{} device(s) found by walking configuration space - the bus is being discovered, \
+             not assumed",
+            pci_devices
+        ),
+    );
+
+    // Wall-clock time. Not decorative: ARCHITECTURE.md section 2e makes
+    // Vault Realm eligibility depend on a publisher signature chain, and a
+    // chain cannot be checked for expiry or revocation without knowing
+    // the date. A trust decision made against an unknown date is not a
+    // weaker decision, it is a different one.
+    let wall_clock = drivers::rtc::init();
+    selftest::check(
+        "wall clock",
+        wall_clock.is_some(),
+        format_args!(
+            "the RTC reports {} seconds since the Unix epoch",
+            wall_clock.map(|now| now.to_unix_seconds()).unwrap_or(0)
+        ),
+    );
+
+    drivers::input::init_mouse();
+
     match boot_info.framebuffer.as_mut() {
         Some(framebuffer) => paint_framebuffer(framebuffer),
         None => serial_println!(
@@ -750,6 +784,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// correct behaviour for a physical machine: finishing a self-test is not
 /// a reason to power off.
 fn epilogue() -> ! {
+    let (queued, dropped) = drivers::input::stats();
+    let (pointer_x, pointer_y) = drivers::input::pointer_position();
+    serial_println!(
+        "Najm Kernel: input - {} event(s) queued, {} dropped, pointer at ({}, {})",
+        queued,
+        dropped,
+        pointer_x,
+        pointer_y
+    );
+
+
     serial_println!(
         "Najm Kernel: {} syscalls dispatched, {} timer ticks ({} ms of uptime)",
         syscall::count(),

@@ -7,5 +7,8 @@
 //! normally enumerate - worth revisiting if/when a USB HID stack makes
 //! keyboard input arrive a different way.
 
+pub mod input;
+pub mod pci;
 pub mod qemu;
+pub mod rtc;
 pub mod serial;
