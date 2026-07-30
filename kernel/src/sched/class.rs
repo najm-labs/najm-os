@@ -97,6 +97,7 @@ impl SchedClass {
     /// documented guarantee and the enforced behaviour cannot drift
     /// apart - a comment claiming 10 ms next to a quantum that had been
     /// changed to 5 ticks would be worse than no comment.
+    #[allow(dead_code)]
     pub const fn worst_case_wait_ms(self) -> u64 {
         self.quantum_ticks() * 1000 / TIMER_HZ
     }

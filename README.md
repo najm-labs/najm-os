@@ -5,7 +5,7 @@
 Najm OS is designed from the ground up to solve a problem no mainstream OS solves well: running latency-critical gaming workloads, security-critical paid software, and general-purpose user applications on the *same machine* without any of them compromising the others' performance, security, or integrity guarantees.
 
 > **Status:** Early development, and further along than that phrase
-> usually implies. The kernel boots in QEMU with **33 self-tests passing
+> usually implies. The kernel boots in QEMU with **37 self-tests passing
 > on every boot** (`make test`), and each of them checks real hardware
 > behaviour rather than a claim in a comment.
 >
@@ -16,7 +16,8 @@ Najm OS is designed from the ground up to solve a problem no mainstream OS solve
 > **Ring 3 preemption**; a **read-only filesystem** with real file
 > syscalls; **PCI enumeration**, a real-time clock, keyboard and mouse; a
 > **compositor with the non-spoofable trusted path** ARCHITECTURE.md
-> section 2d specifies; **Mirage**, which runs a Windows PE binary
+> section 2d specifies, with **tiling and floating window modes** (F1
+> toggles) on one desktop; **capability-gated IPC**; **Mirage**, which runs a Windows PE binary
 > natively; and **Najm Store** package verification implementing
 > ARCHITECTURE.md 2e's rule that Realm elevation is a credential rather
 > than a declaration.

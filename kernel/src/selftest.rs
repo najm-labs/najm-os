@@ -67,6 +67,7 @@ pub fn check(name: &str, passed: bool, detail: core::fmt::Arguments) {
 /// shape, so the comparison and the reporting can't disagree about which
 /// value was expected - a real hazard when both are written out by hand
 /// at each call site.
+#[allow(dead_code)]
 pub fn check_eq<T: PartialEq + core::fmt::Debug>(name: &str, actual: T, expected: T) {
     let passed = actual == expected;
     if passed {
@@ -82,6 +83,7 @@ pub fn check_eq<T: PartialEq + core::fmt::Debug>(name: &str, actual: T, expected
 
 /// How many checks have failed so far. Read by the epilogue to decide
 /// which exit code to hand QEMU.
+#[allow(dead_code)]
 pub fn failures() -> u32 {
     FAILED.load(Ordering::Relaxed)
 }

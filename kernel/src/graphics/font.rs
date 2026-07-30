@@ -155,6 +155,10 @@ pub fn glyph(character: char) -> [u8; 5] {
 ///
 /// Includes the trailing advance of the last character, which is what
 /// makes right-aligning a string against this value produce even margins.
+/// Unused until something needs to right-align or centre text; kept
+/// because a font module without a measurement function forces every
+/// caller to recompute the advance, and they will disagree.
+#[allow(dead_code)]
 pub fn text_width(text: &str) -> usize {
     text.chars().count() * ADVANCE
 }

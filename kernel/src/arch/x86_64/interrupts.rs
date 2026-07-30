@@ -23,7 +23,6 @@
 
 use super::gdt;
 use super::usermode::{self, ProgramExit};
-use crate::serial_print;
 use crate::serial_println;
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, Ordering};

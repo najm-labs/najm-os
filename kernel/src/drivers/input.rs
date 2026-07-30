@@ -139,6 +139,24 @@ pub fn pointer_position() -> (u64, u64) {
     *POINTER.lock()
 }
 
+/// Scancode set 1 for F1, the layout-toggle hotkey.
+const SCANCODE_F1: u64 = 0x3B;
+
+/// Set when the layout hotkey is pressed, drained by the compositor.
+///
+/// A flag rather than a direct call, because this is set inside an
+/// interrupt handler and the compositor is behind a lock that `present`
+/// holds for close to a million pixel writes. An IRQ that took that lock
+/// would spin forever whenever it interrupted a task already holding it.
+/// An atomic cannot deadlock.
+static LAYOUT_TOGGLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Consumes a pending layout-toggle request.
+pub fn take_layout_toggle() -> bool {
+    LAYOUT_TOGGLE.swap(false, core::sync::atomic::Ordering::SeqCst)
+}
+
 /// Called from the keyboard IRQ with a raw scancode.
 ///
 /// Scancode set 1: a byte with the high bit clear is a press, with it set
@@ -151,6 +169,17 @@ pub fn pointer_position() -> (u64, u64) {
 pub fn on_scancode(scancode: u8) {
     let released = scancode & 0x80 != 0;
     let code = (scancode & 0x7F) as u64;
+
+    // Hotkeys are consumed by the system, not delivered to applications.
+    // That is the correct direction and it matters for more than tidiness:
+    // a key combination that switches the window layout must work even
+    // when the focused window is a fullscreen Gaming Realm process that
+    // would otherwise receive every key. The same reasoning is why
+    // Ctrl+Alt+Del is intercepted below the application layer on Windows.
+    if !released && code == SCANCODE_F1 {
+        LAYOUT_TOGGLE.store(true, core::sync::atomic::Ordering::SeqCst);
+        return;
+    }
 
     push(InputEvent {
         kind: if released {

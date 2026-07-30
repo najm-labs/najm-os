@@ -559,7 +559,7 @@ fn build_test_pe() -> Vec<u8> {
     pe[0x3C..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
 
     let mut at = pe_offset;
-    let mut put = |pe: &mut Vec<u8>, at: &mut usize, bytes: &[u8]| {
+    let put = |pe: &mut Vec<u8>, at: &mut usize, bytes: &[u8]| {
         pe[*at..*at + bytes.len()].copy_from_slice(bytes);
         *at += bytes.len();
     };
@@ -605,7 +605,7 @@ fn build_test_pe() -> Vec<u8> {
     // absent rather than empty.
     let directories = at;
     at = directories + 16 * 8;
-    let mut directory = |pe: &mut Vec<u8>, index: usize, rva: u32, size: u32| {
+    let directory = |pe: &mut Vec<u8>, index: usize, rva: u32, size: u32| {
         let base = directories + index * 8;
         pe[base..base + 4].copy_from_slice(&rva.to_le_bytes());
         pe[base + 4..base + 8].copy_from_slice(&size.to_le_bytes());
@@ -620,7 +620,7 @@ fn build_test_pe() -> Vec<u8> {
     );
 
     // Section table.
-    let mut section = |pe: &mut Vec<u8>,
+    let section = |pe: &mut Vec<u8>,
                        at: &mut usize,
                        name: &[u8; 8],
                        virtual_size: u32,

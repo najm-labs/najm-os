@@ -63,7 +63,6 @@ mod syscall;
 
 use alloc::vec::Vec;
 use bootloader_api::config::{BootloaderConfig, Mapping};
-use bootloader_api::info::{FrameBuffer, PixelFormat};
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -391,65 +390,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     drivers::input::init_mouse();
 
-    // The graphics stack. Themes are loaded from the boot archive if one
-    // is present, which is the customization layer ARCHITECTURE.md 2c
-    // calls the Realm Shell; the trusted path the same section requires
-    // is drawn by the compositor from kernel state and is deliberately
-    // not reachable from a theme at all.
-    let theme = match fs::read_all("/etc/theme.conf") {
-        Some(bytes) => {
-            let text = alloc::string::String::from_utf8_lossy(&bytes);
-            let (theme, applied, rejected) = graphics::theme::Theme::parse(&text);
-            serial_println!(
-                "Najm Kernel: theme loaded from /etc/theme.conf - {} setting(s) applied, {} \
-                 line(s) rejected",
-                applied,
-                rejected
-            );
-            theme
-        }
-        None => {
-            serial_println!("Najm Kernel: no /etc/theme.conf, using the built-in theme");
-            graphics::theme::Theme::DEFAULT
-        }
-    };
-
-    match boot_info.framebuffer.as_mut() {
-        Some(framebuffer) => {
-            let info = framebuffer.info();
-            let buffer = framebuffer.buffer_mut();
-            // Safety: `buffer` is the framebuffer mapping the bootloader
-            // established, writable for its own length, and `info` is the
-            // geometry the bootloader reported for exactly that mapping.
-            // The `Framebuffer` takes the address rather than the slice so
-            // that every write is bounds-checked at the point of writing -
-            // see that type's documentation for why that matters for a
-            // compositor placing untrusted content.
-            let framebuffer = unsafe {
-                graphics::framebuffer::Framebuffer::new(
-                    buffer.as_mut_ptr() as u64,
-                    buffer.len(),
-                    info.width,
-                    info.height,
-                    info.stride * info.bytes_per_pixel,
-                    info.bytes_per_pixel,
-                    info.pixel_format,
-                )
-            };
-            serial_println!(
-                "Najm Kernel: framebuffer {}x{}, {} bytes/px, format {:?}",
+    // The framebuffer's geometry is captured here, but the compositor is
+    // *not* started yet - see the note where it is, below the archive
+    // mount. Capturing the address and length now rather than later keeps
+    // the borrow of `boot_info` confined to this block, so the ramdisk
+    // can be taken from the same struct afterwards.
+    let framebuffer = boot_info.framebuffer.as_mut().map(|framebuffer| {
+        let info = framebuffer.info();
+        let buffer = framebuffer.buffer_mut();
+        serial_println!(
+            "Najm Kernel: framebuffer {}x{}, {} bytes/px, format {:?}",
+            info.width,
+            info.height,
+            info.bytes_per_pixel,
+            info.pixel_format
+        );
+        // Safety: `buffer` is the framebuffer mapping the bootloader
+        // established, writable for its own length, and `info` is the
+        // geometry the bootloader reported for exactly that mapping. The
+        // `Framebuffer` takes the address rather than the slice so that
+        // every write is bounds-checked at the point of writing - see
+        // that type's documentation for why that matters for a compositor
+        // placing untrusted content.
+        unsafe {
+            graphics::framebuffer::Framebuffer::new(
+                buffer.as_mut_ptr() as u64,
+                buffer.len(),
                 info.width,
                 info.height,
+                info.stride * info.bytes_per_pixel,
                 info.bytes_per_pixel,
-                info.pixel_format
-            );
-            graphics::compositor::init(framebuffer, theme);
-            graphics::compositor::present();
+                info.pixel_format,
+            )
         }
-        None => serial_println!(
-            "Najm Kernel: bootloader provided no framebuffer - the compositor is unavailable, \
-             which is expected on a headless boot and is reported rather than assumed"
-        ),
+    });
+
+    if framebuffer.is_none() {
+        serial_println!(
+            "Najm Kernel: bootloader provided no framebuffer - the compositor will be \
+             unavailable, which is expected on a headless boot and is reported rather than \
+             assumed"
+        );
     }
 
     serial_println!("Najm Kernel: initialization complete, starting task scheduler");
@@ -604,6 +585,47 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // The negative half, checked kernel-side as well as from userland: a
     // path with a `..` component must not resolve, whatever it would have
     // resolved to.
+    // The compositor starts *here*, after the filesystem exists, because
+    // its theme comes out of the boot archive.
+    //
+    // It used to start earlier, alongside the framebuffer setup, and the
+    // theme lookup therefore ran before anything was mounted - so
+    // `/etc/theme.conf` was reported missing on every boot while sitting
+    // plainly in the archive listing a few lines below. The fallback
+    // theme is legitimate behaviour, which is exactly what made the bug
+    // survive: the screen looked right, and the log line explaining why
+    // was accurate about the wrong thing.
+    if let Some(framebuffer) = framebuffer {
+        let theme = match fs::read_all("/etc/theme.conf") {
+            Some(bytes) => {
+                let text = alloc::string::String::from_utf8_lossy(&bytes);
+                let (theme, applied, rejected) = graphics::theme::Theme::parse(&text);
+                serial_println!(
+                    "Najm Kernel: theme loaded from /etc/theme.conf - {} setting(s) applied, {} \
+                     line(s) rejected",
+                    applied,
+                    rejected
+                );
+                selftest::check(
+                    "theme loaded from the archive",
+                    applied > 0 && rejected == 0,
+                    format_args!(
+                        "{} colour(s) applied from /etc/theme.conf with {} rejected line(s)",
+                        applied, rejected
+                    ),
+                );
+                theme
+            }
+            None => {
+                serial_println!("Najm Kernel: no /etc/theme.conf, using the built-in theme");
+                graphics::theme::Theme::DEFAULT
+            }
+        };
+
+        graphics::compositor::init(framebuffer, theme);
+        graphics::compositor::present();
+    }
+
     selftest::check(
         "path traversal refused",
         fs::lookup("/etc/../etc/motd").is_none() && fs::lookup("/nonexistent").is_none(),
@@ -881,6 +903,79 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             frames_free_before, frames_free_after
         ),
     );
+
+    // Window layout. Checked with synthetic surfaces rather than by
+    // eyeballing a screenshot, because "the windows look tiled" and "no
+    // window overlaps another, and none of them touches the trust strip"
+    // are different claims and only the second one is checkable.
+    //
+    // Attributed to pid 0, which no process ever has, so these cannot
+    // collide with a real window and are removed by the same
+    // `remove_surfaces_for` path afterwards.
+    if graphics::compositor::stats().1 > 0 {
+        for index in 0..3 {
+            graphics::compositor::create_surface(
+                0,
+                najm_abi::realm_kind::HOME,
+                "layout probe",
+                400,
+                300,
+                graphics::compositor::SurfaceMode::Windowed,
+            );
+            let _ = index;
+        }
+
+        graphics::compositor::set_layout(graphics::compositor::LayoutMode::Tiling);
+        let tiled = graphics::compositor::window_rects();
+
+        // Every rectangle inside the content area, and no two overlapping.
+        // O(n^2) over three windows is fine, and an exhaustive pairwise
+        // check is worth more than a clever one here: the failure this
+        // catches is a layout that looks right for the case someone tested
+        // and overlaps for a count they did not.
+        let trust_bar = graphics::compositor::TRUST_BAR_HEIGHT;
+        let inside = tiled
+            .iter()
+            .all(|&(_, y, _, height)| y >= trust_bar && height > 0);
+        let mut overlapping = false;
+        for (index, a) in tiled.iter().enumerate() {
+            for b in tiled.iter().skip(index + 1) {
+                let separated = a.0 + a.2 <= b.0
+                    || b.0 + b.2 <= a.0
+                    || a.1 + a.3 <= b.1
+                    || b.1 + b.3 <= a.1;
+                if !separated {
+                    overlapping = true;
+                }
+            }
+        }
+
+        selftest::check(
+            "tiling layout",
+            tiled.len() == 3 && inside && !overlapping,
+            format_args!(
+                "{} windows tiled with no overlap, all below the trust strip: {:?}",
+                tiled.len(),
+                tiled
+            ),
+        );
+
+        // And back. A toggle that only works in one direction is a mode
+        // switch you can enter and not leave.
+        graphics::compositor::set_layout(graphics::compositor::LayoutMode::Floating);
+        selftest::check(
+            "layout toggle",
+            graphics::compositor::layout() == graphics::compositor::LayoutMode::Floating
+                && graphics::compositor::window_rects().len() == 3,
+            format_args!(
+                "switched back to {} with all windows intact",
+                graphics::compositor::layout().name()
+            ),
+        );
+
+        graphics::compositor::remove_surfaces_for(0);
+        graphics::compositor::present();
+    }
 
     // The trusted-path checks. These are the ones that matter most in
     // this whole file, because a trusted path that is merely *drawn* and

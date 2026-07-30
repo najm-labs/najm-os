@@ -329,6 +329,7 @@ pub fn snapshot() -> Vec<(u64, String, ProcessState)> {
 }
 
 /// How many processes have been created since boot.
+#[allow(dead_code)]
 pub fn count() -> u64 {
     NEXT_PID.load(Ordering::Relaxed) - 1
 }

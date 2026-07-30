@@ -101,8 +101,14 @@ impl Manifest {
         };
 
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
+            let line = line.trim();
+            // A comment starts a line; `#` is not stripped from the
+            // middle of one. See the equivalent note in
+            // `graphics::theme::Theme::parse` - inline comment stripping
+            // silently truncated every value in the theme format, and a
+            // publisher name or version string is just as entitled to
+            // contain a `#`.
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
@@ -167,6 +173,12 @@ fn capability_bit(name: &str) -> Option<u64> {
 
 /// Why a signature could not be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Unverified` and `Verified` are never constructed today, and that is
+/// the finding rather than dead code: `verify_signature` is unimplemented
+/// and fails closed, so no package can currently be elevated. The variants
+/// exist so that implementing it is filling in a function rather than
+/// also changing every type it touches.
+#[allow(dead_code)]
 pub enum SignatureStatus {
     /// No signature was present. Not an error - an unsigned package is a
     /// perfectly legitimate thing to install, it simply cannot be
@@ -385,6 +397,7 @@ fn verify_signature(bytes: &[u8], _manifest: &Manifest) -> SignatureStatus {
 /// for the thing it should be useful for (an application declaring it
 /// needs less than it could have, so a user can see that) and useless for
 /// the thing it must not be (acquiring a right).
+#[allow(dead_code)]
 pub fn effective_profile(verdict: &Verdict) -> RealmProfile {
     let mut profile = verdict.granted_realm;
 
@@ -439,6 +452,7 @@ pub fn report(verdict: &Verdict) {
 /// The payload reuses the boot archive format rather than inventing a
 /// second one. Two archive formats in one system means two parsers, and
 /// the parser is the part handling untrusted input.
+#[allow(dead_code)]
 pub fn payload(bytes: &[u8]) -> Result<&[u8], StoreError> {
     if bytes.len() < HEADER_SIZE {
         return Err(StoreError::TooSmall);
@@ -453,6 +467,7 @@ pub fn payload(bytes: &[u8]) -> Result<&[u8], StoreError> {
 
 /// Builds a package's digest the way `verify` checks it, for tests and
 /// for whatever eventually writes packages.
+#[allow(dead_code)]
 pub fn compute_digest(manifest: &[u8], payload: &[u8]) -> [u8; 32] {
     let mut hasher = sha256::Sha256::new();
     hasher.update(manifest);

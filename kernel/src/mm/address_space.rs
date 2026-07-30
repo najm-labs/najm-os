@@ -150,6 +150,7 @@ impl AddressSpace {
 
     /// How many frames this address space owns, for the boot report and
     /// for checking that teardown actually gave them back.
+    #[allow(dead_code)]
     pub fn owned_frame_count(&self) -> usize {
         self.owned_frames.len()
     }
@@ -398,6 +399,12 @@ impl AddressSpace {
     /// only one address space. Asking a specific address space makes the
     /// question "does the calling process own this memory", which is the
     /// one a syscall actually needs answered.
+    /// Unused today: with per-process page tables, the *active* tables
+    /// are the calling process's, so `mm::memory`'s walk already answers
+    /// the ownership question. This is what a syscall would need in order
+    /// to validate a pointer against an address space that is *not*
+    /// current - which is exactly what `spawn` and `wait` will want.
+    #[allow(dead_code)]
     pub fn range_is_accessible(&self, start: u64, len: u64, require_writable: bool) -> bool {
         if len == 0 {
             return true;
@@ -584,6 +591,11 @@ fn table_ref<'a>(_mapper: &'a OffsetPageTable<'static>, frame: PhysFrame) -> &'a
 /// stacks and data - which is precisely the property the higher-half
 /// split was built to provide. It is *not* automatic for any lower-half
 /// pointer the caller is holding across the switch.
+/// Unused today because the scheduler loads CR3 during a switch rather
+/// than having a process activate its own space. Kept as the explicit
+/// operation any future path that runs *in* another address space
+/// without switching tasks would need.
+#[allow(dead_code)]
 pub unsafe fn activate(space: &AddressSpace) -> PhysFrame {
     let (previous, flags) = Cr3::read();
     if previous != space.root {
@@ -637,6 +649,7 @@ pub fn record_kernel_root() {
 static KERNEL_ROOT: spin::Once<PhysFrame> = spin::Once::new();
 
 /// Convenience for `Cr3Flags`-free callers.
+#[allow(dead_code)]
 pub fn current_root() -> PhysFrame {
     Cr3::read().0
 }

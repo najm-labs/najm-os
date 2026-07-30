@@ -121,6 +121,10 @@ pub const VAULT: RealmProfile = RealmProfile {
 /// The compositor and other Core-adjacent services. Not assignable to an
 /// installed application by any path - it is listed so a process can
 /// observe that it is running in it, never request it.
+/// Unconstructed by design: nothing may be *placed* in this Realm yet,
+/// which is the point. It is defined so a process can observe it and so
+/// the compositor can name it, never so an installer can request it.
+#[allow(dead_code)]
 pub const SYSTEM: RealmProfile = RealmProfile {
     name: "System Realm",
     kind: najm_abi::realm_kind::SYSTEM,

@@ -118,12 +118,24 @@ impl Theme {
         let mut rejected = 0;
 
         for line in text.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            // A line that is empty *after* stripping a comment is not a
-            // rejection - it is a comment, which is a legitimate thing for
-            // a config file to contain. Counting it as an error would make
-            // a well-commented theme look broken.
-            if line.is_empty() {
+            let line = line.trim();
+
+            // A comment is a line that *starts* with `#`, not everything
+            // after the first `#` anywhere on the line.
+            //
+            // That distinction is the whole bug this format walked into.
+            // Stripping inline comments is the obvious thing to write,
+            // and in this format it is wrong, because `#` is also how a
+            // colour is spelled: `desktop = #0d1117` becomes
+            // `desktop =` with the value cut off. Every line of a
+            // perfectly valid theme was rejected, and the fallback theme
+            // rendered correctly - so the screen looked right and only
+            // the "0 settings applied" count said otherwise.
+            //
+            // Inline comments are therefore not supported, and cannot be
+            // without giving the format more structure (quoting, or a
+            // different comment marker) than a colour list should need.
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
 

@@ -108,6 +108,11 @@ struct Port {
 /// message body would be trusting the one field an attacker fully
 /// controls.
 pub struct Message {
+    /// Recorded by the kernel at send time, not carried in the payload -
+    /// a service trusting a sender identity out of the message body would
+    /// be trusting the one field an attacker fully controls. Unread until
+    /// a service needs to answer "who asked".
+    #[allow(dead_code)]
     pub from: u64,
     pub bytes: Vec<u8>,
 }
@@ -292,6 +297,7 @@ pub fn stats() -> (usize, usize, u64) {
 /// Prints the live ports, so a service that failed to start is visible as
 /// an absent name rather than as a client that mysteriously cannot
 /// connect.
+#[allow(dead_code)]
 pub fn report() {
     for (handle, name, owner, queued) in x86_64::instructions::interrupts::without_interrupts(|| {
         PORTS

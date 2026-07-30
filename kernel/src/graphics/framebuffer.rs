@@ -68,6 +68,7 @@ impl Colour {
     /// kernel's interrupt-adjacent paths, and introducing it in a
     /// compositor would mean saving and restoring SSE state across
     /// context switches for the sake of a lerp.
+    #[allow(dead_code)]
     pub fn blend(self, other: Colour, amount: u8) -> Colour {
         let mix = |a: u8, b: u8| {
             (((a as u16) * (255 - amount as u16) + (b as u16) * amount as u16) / 255) as u8
@@ -220,6 +221,7 @@ impl Framebuffer {
         self.fill_rect(x + width - 1, y, 1, height, colour);
     }
 
+    #[allow(dead_code)]
     pub fn clear(&self, colour: Colour) {
         self.fill_rect(0, 0, self.width, self.height, colour);
     }

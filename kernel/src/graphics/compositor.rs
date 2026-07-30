@@ -54,6 +54,54 @@ use spin::Mutex;
 /// inside a window.
 pub const TRUST_BAR_HEIGHT: usize = 20;
 
+/// How windows are arranged on the desktop.
+///
+/// Two modes, because the two ways people actually use a screen are
+/// genuinely different and neither is a degraded version of the other:
+///
+/// - [`Floating`](LayoutMode::Floating) is the desktop everyone knows.
+///   Windows have positions, they overlap, and moving one is a thing you
+///   do. It is the right default because it is what a person expects
+///   before they have decided to have an opinion.
+/// - [`Tiling`](LayoutMode::Tiling) is Hyprland's model: every window is
+///   given a share of the screen automatically, nothing overlaps, and
+///   there is no such thing as an unused pixel or a window hidden behind
+///   another. It is the right choice for someone who works with several
+///   things at once and does not want to spend attention arranging them.
+///
+/// It is still a **desktop** in both modes - the same compositor, the
+/// same trust bar, the same Realms. Tiling changes where windows go, not
+/// what they are. That distinction matters: a tiling *window manager*
+/// that is a separate universe from the desktop is a fork in the user's
+/// mental model, whereas a toggle is a preference.
+///
+/// Exclusive fullscreen (a Gaming Realm) ignores both, and still cannot
+/// reach the trust strip - see `SurfaceMode::Fullscreen`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Windows are placed where they were put and may overlap.
+    Floating,
+    /// Windows are packed to fill the content area, never overlapping.
+    Tiling,
+}
+
+impl LayoutMode {
+    pub const fn name(self) -> &'static str {
+        match self {
+            LayoutMode::Floating => "floating (desktop)",
+            LayoutMode::Tiling => "tiling",
+        }
+    }
+}
+
+/// Gap between tiled windows, and between a window and the screen edge.
+///
+/// Non-zero because two windows sharing an edge are visually one window
+/// with a line through it - the gap is what makes the boundary legible
+/// without needing a heavy border. Small enough that it does not feel
+/// like wasted space.
+const TILE_GAP: usize = 6;
+
 /// How a surface occupies the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceMode {
@@ -82,6 +130,10 @@ pub struct Surface {
     /// Cached at creation from the process's Realm. Read from the process
     /// table rather than supplied by the process - see threat 3.
     pub realm_kind: u64,
+    /// Shown in the trust bar for a focused window. Not yet read - the
+    /// bar names the *Realm* rather than the window, which is the more
+    /// important of the two and the one that cannot be spoofed.
+    #[allow(dead_code)]
     pub title: String,
     pub x: usize,
     pub y: usize,
@@ -92,9 +144,22 @@ pub struct Surface {
 }
 
 impl Surface {
-    /// Bytes a committed frame for this surface must be.
-    pub fn frame_bytes(&self) -> usize {
-        self.width * self.height * 4
+    /// Changes this surface's size, reallocating and zeroing its buffer.
+    ///
+    /// Zeroed rather than preserved, and that is not laziness: the buffer
+    /// is about to be reinterpreted at a different width, so every row
+    /// after the first would land at the wrong offset. Keeping the old
+    /// pixels would produce a sheared image of the previous frame, which
+    /// looks like a compositor bug rather than a window awaiting a
+    /// redraw.
+    fn resize(&mut self, width: usize, height: usize) {
+        if self.width == width && self.height == height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.pixels.clear();
+        self.pixels.resize(width * height, 0);
     }
 }
 
@@ -106,6 +171,8 @@ struct CompositorState {
     /// trust bar names.
     focused: Option<u64>,
     theme: Theme,
+    /// How windowed surfaces are arranged. See [`LayoutMode`].
+    layout: LayoutMode,
     /// The per-boot colour sequence described in the module docs. Never
     /// leaves the kernel.
     signature: [Colour; SIGNATURE_BLOCKS],
@@ -133,6 +200,7 @@ static COMPOSITOR: Mutex<CompositorState> = Mutex::new(CompositorState {
     next_surface_id: 1,
     focused: None,
     theme: Theme::DEFAULT,
+    layout: LayoutMode::Floating,
     signature: [Colour::rgb(0, 0, 0); SIGNATURE_BLOCKS],
     frames: 0,
     last_present_tick: 0,
@@ -224,8 +292,11 @@ pub fn create_surface(
         SurfaceMode::Windowed => {
             let width = width.min(content_width);
             let height = height.min(content_height);
-            // Cascade windows so a second one is visibly a second one
-            // rather than exactly covering the first.
+            // A starting position for floating mode. In tiling mode this
+            // is overwritten by `relayout` below before anything is
+            // drawn, so it only has to be somewhere sensible rather than
+            // correct - cascading so a second window is visibly a second
+            // one rather than exactly covering the first.
             let index = compositor.surfaces.len();
             let x = (content_x + 40 + index * 30).min(content_x + content_width - width);
             let y = (content_y + 30 + index * 26)
@@ -266,7 +337,139 @@ pub fn create_surface(
     // window that just appeared.
     compositor.focused = Some(id);
 
+    // In tiling mode every window's share changes when one is added, so
+    // this is not a placement for the new window - it is a placement for
+    // all of them.
+    relayout(&mut compositor);
+
     Some(id)
+}
+
+/// Recomputes every windowed surface's geometry for the current mode.
+///
+/// Called whenever the set of windows changes or the mode is toggled.
+/// Fullscreen surfaces are skipped: they already own the content area,
+/// and a Gaming Realm's frame is not something to rearrange around.
+///
+/// A surface whose size changes has its pixel buffer reallocated and
+/// **zeroed**, which has a consequence worth stating rather than
+/// discovering: the program's next `surface_commit` will be the wrong
+/// length and will be refused. That is the correct behaviour and the same
+/// thing every real compositor does - a resize is a request to the
+/// application to draw again at the new size, and it finds out by asking
+/// (`surface_info`) after its commit is rejected. Silently accepting a
+/// stale-sized frame would mean stretching or cropping someone else's
+/// pixels into the gap.
+fn relayout(compositor: &mut CompositorState) {
+    let Some(framebuffer) = compositor.framebuffer else {
+        return;
+    };
+    let (content_x, content_y, content_width, content_height) = content_region(&framebuffer);
+
+    if compositor.layout == LayoutMode::Floating {
+        // Floating windows keep whatever position they have; the only
+        // thing to enforce is that none of them has drifted outside the
+        // content area, which would put it over the trust strip.
+        for surface in &mut compositor.surfaces {
+            if surface.mode == SurfaceMode::Windowed {
+                surface.y = surface.y.max(content_y);
+            }
+        }
+        return;
+    }
+
+    let tiled: Vec<usize> = compositor
+        .surfaces
+        .iter()
+        .enumerate()
+        .filter(|(_, surface)| surface.mode == SurfaceMode::Windowed)
+        .map(|(index, _)| index)
+        .collect();
+
+    if tiled.is_empty() {
+        return;
+    }
+
+    // Dwindle, which is Hyprland's default and the reason it feels
+    // predictable: each new window takes half of what remains, split
+    // along whichever axis is currently longer. The result is that the
+    // first window keeps the largest share, no window is ever a sliver,
+    // and adding one never rearranges the others beyond shrinking them.
+    //
+    // The alternative - an even grid - looks tidier in a screenshot and
+    // is worse to use, because adding a fifth window to a 2x2 grid moves
+    // every window on the screen.
+    let mut x = content_x + TILE_GAP;
+    let mut y = content_y + TILE_GAP;
+    let mut width = content_width.saturating_sub(TILE_GAP * 2);
+    let mut height = content_height.saturating_sub(TILE_GAP * 2);
+
+    let count = tiled.len();
+    for (position, &index) in tiled.iter().enumerate() {
+        let last = position + 1 == count;
+
+        let (tile_x, tile_y, tile_width, tile_height) = if last {
+            // The final window takes everything left, so the layout has
+            // no leftover strip - a remainder pixel column is exactly the
+            // kind of thing that looks like a rendering bug.
+            (x, y, width, height)
+        } else if width >= height {
+            // Split vertically: this window takes the left half.
+            let half = (width - TILE_GAP) / 2;
+            let taken = (x, y, half, height);
+            x += half + TILE_GAP;
+            width -= half + TILE_GAP;
+            taken
+        } else {
+            // Split horizontally: this window takes the top half.
+            let half = (height - TILE_GAP) / 2;
+            let taken = (x, y, width, half);
+            y += half + TILE_GAP;
+            height -= half + TILE_GAP;
+            taken
+        };
+
+        let surface = &mut compositor.surfaces[index];
+        surface.x = tile_x;
+        surface.y = tile_y;
+        surface.resize(tile_width.max(1), tile_height.max(1));
+    }
+}
+
+/// Switches layout mode and rearranges.
+pub fn set_layout(mode: LayoutMode) {
+    let mut compositor = COMPOSITOR.lock();
+    if compositor.layout == mode {
+        return;
+    }
+    compositor.layout = mode;
+    relayout(&mut compositor);
+    crate::serial_println!("Najm Kernel: window layout is now {}", mode.name());
+}
+
+/// The current layout mode.
+pub fn layout() -> LayoutMode {
+    COMPOSITOR.lock().layout
+}
+
+/// Flips between the two modes.
+pub fn toggle_layout() {
+    let next = match layout() {
+        LayoutMode::Floating => LayoutMode::Tiling,
+        LayoutMode::Tiling => LayoutMode::Floating,
+    };
+    set_layout(next);
+}
+
+/// The geometry of every windowed surface, for the layout self-test.
+pub fn window_rects() -> Vec<(usize, usize, usize, usize)> {
+    COMPOSITOR
+        .lock()
+        .surfaces
+        .iter()
+        .filter(|surface| surface.mode == SurfaceMode::Windowed)
+        .map(|surface| (surface.x, surface.y, surface.width, surface.height))
+        .collect()
 }
 
 /// The largest surface that may be created, in pixels. Four bytes each,
@@ -362,6 +565,10 @@ pub fn remove_surfaces_for(pid: u64) {
             compositor.focused = compositor.surfaces.last().map(|s| s.id);
         }
     }
+    // The remaining windows expand to fill what the closed one left. In
+    // floating mode this does nothing, which is correct - a window
+    // closing should not move the others.
+    relayout(&mut compositor);
 }
 
 /// A surface's geometry, for `surface_info`.
@@ -413,6 +620,17 @@ pub fn present_throttled() {
 }
 
 pub fn present() {
+    // The layout hotkey is consumed here rather than acted on in the
+    // keyboard interrupt, and that is a deliberate structural choice
+    // rather than a convenience. An IRQ handler that took the compositor
+    // lock would spin forever whenever it interrupted a task already
+    // holding it - and `present` holds it for close to a million pixel
+    // writes, so the window is enormous. An atomic flag set in the
+    // handler and drained here cannot deadlock at all.
+    if crate::drivers::input::take_layout_toggle() {
+        toggle_layout();
+    }
+
     let mut compositor = COMPOSITOR.lock();
     let Some(framebuffer) = compositor.framebuffer else {
         return;

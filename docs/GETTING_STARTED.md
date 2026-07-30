@@ -380,7 +380,15 @@ smallest possible working slice. The next milestones, in order (see
     namespace, which is how a service gets impersonated. Bounded queues
     that refuse rather than block or drop, and ports reclaimed when their
     owner exits, without which restarting a service would fail.
-25. ~~Najm Store package verification.~~ Done - see `kernel/src/store.rs`
+25. ~~Window layout modes.~~ Done - see `graphics::compositor::LayoutMode`.
+    Two modes on one desktop: **floating**, where windows have positions
+    and may overlap, and **tiling**, which packs them to fill the screen
+    with no overlap using the dwindle split Hyprland defaults to. **F1**
+    toggles. It is the same compositor, the same trust bar and the same
+    Realms in both - tiling changes where windows go, not what they are.
+    A Gaming Realm's exclusive fullscreen ignores both and still cannot
+    reach the trust strip.
+26. ~~Najm Store package verification.~~ Done - see `kernel/src/store.rs`
     and `docs/APP_SDK.md`. SHA-256 integrity checking against FIPS
     180-4's own vectors, and ARCHITECTURE.md 2e's Realm assignment
     policy: elevation is a credential, not a declaration, and the
@@ -388,7 +396,7 @@ smallest possible working slice. The next milestones, in order (see
 
 ### What one boot now proves
 
-`make test` boots the system headless, runs **33 self-tests**, and exits
+`make test` boots the system headless, runs **37 self-tests**, and exits
 with a verdict. Every one of them is a live check against real hardware
 behaviour rather than a claim in a comment:
 
@@ -413,6 +421,8 @@ behaviour rather than a claim in a comment:
 - The compositor's reserved strip is unreachable by any surface, and the
   trust signature is verified by reading pixels back *out* of the
   framebuffer.
+- Tiling produces three non-overlapping rectangles, all below the trust
+  strip, and the toggle works in both directions.
 - A Windows PE binary runs and exits with a status that only survives if
   relocation, import binding and calling-convention translation all
   worked.
