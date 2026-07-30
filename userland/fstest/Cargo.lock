@@ -7,7 +7,7 @@ name = "najm-abi"
 version = "0.1.0"
 
 [[package]]
-name = "najm-hello"
+name = "najm-fstest"
 version = "0.1.0"
 dependencies = [
  "najm-abi",

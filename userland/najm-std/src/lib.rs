@@ -1,4 +1,17 @@
-//! Thin wrappers around Najm OS's `int 0x80` syscall interface.
+#![no_std]
+
+//! The Najm OS userland runtime: safe wrappers around `int 0x80`.
+//!
+//! The nearest thing this system has to a C library, and deliberately
+//! almost nothing: syscall wrappers, and no allocator, no formatting
+//! machinery, and no collections. A Ring 3 program here has a fixed
+//! stack, no heap, and no unwinder, so anything that could allocate or
+//! panic-with-formatting would be a liability rather than a convenience.
+//!
+//! It exists because there is now more than one userland program. The
+//! wrappers used to live inside `hello` and were copied into the next
+//! program that needed them, which is how one interface quietly becomes
+//! two.
 //!
 //! The register convention is the kernel's, not a choice made here: RAX
 //! carries the syscall number, RDI/RSI/RDX carry up to three arguments,
@@ -158,4 +171,128 @@ pub fn exit(status: u32) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+// --- Filesystem -----------------------------------------------------
+//
+// Every one of these returns `Result<_, u64>` where the error is a
+// `najm_abi::err` number. Returning the *specific* error rather than a
+// bare failure is what lets a program - and a test - distinguish "that
+// file does not exist" from "I am not allowed to read files" from "that
+// pointer was rejected", which are three completely different bugs.
+
+/// Opens `path`, returning a file descriptor.
+pub fn open(path: &[u8], flags: u64) -> Result<u64, u64> {
+    // Safety: `path` is a real slice, so pointer and length are
+    // consistent. The kernel validates the path itself - this wrapper
+    // deliberately does not pre-validate, so that a program passing a
+    // bad path observes the kernel's answer rather than a local one.
+    decode(unsafe { syscall3(sys::OPEN, path.as_ptr() as u64, path.len() as u64, flags) })
+}
+
+/// Reads into `buf`, returning how many bytes were read. Zero means end
+/// of file.
+pub fn read(descriptor: u64, buf: &mut [u8]) -> Result<u64, u64> {
+    // Safety: `buf` is a real mutable slice; the kernel writes at most
+    // `buf.len()` bytes into it and validates the range against this
+    // process's own page tables before doing so.
+    decode(unsafe {
+        syscall3(
+            sys::READ,
+            descriptor,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    })
+}
+
+/// Closes a descriptor.
+pub fn close(descriptor: u64) -> Result<u64, u64> {
+    // Safety: no pointer arguments.
+    decode(unsafe { syscall3(sys::CLOSE, descriptor, 0, 0) })
+}
+
+/// Moves a descriptor's read position, returning the new position.
+pub fn seek(descriptor: u64, offset: u64, whence: u64) -> Result<u64, u64> {
+    // Safety: no pointer arguments.
+    decode(unsafe { syscall3(sys::SEEK, descriptor, offset, whence) })
+}
+
+/// Fills `info` with metadata about `path`.
+pub fn stat(path: &[u8], info: &mut najm_abi::FileInfo) -> Result<u64, u64> {
+    // Safety: `path` is a real slice, and `info` is a real `&mut` to a
+    // `#[repr(C)]` struct of the exact size the kernel writes. The kernel
+    // validates the destination is writable in this process's page tables
+    // regardless.
+    decode(unsafe {
+        syscall3(
+            sys::STAT,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            info as *mut najm_abi::FileInfo as u64,
+        )
+    })
+}
+
+/// Fills `buf` with the NUL-separated names of a directory's entries,
+/// returning how many bytes were written.
+pub fn readdir(descriptor: u64, buf: &mut [u8]) -> Result<u64, u64> {
+    // Safety: `buf` is a real mutable slice - same reasoning as `read`.
+    decode(unsafe {
+        syscall3(
+            sys::READDIR,
+            descriptor,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    })
+}
+
+/// This process's id.
+pub fn getpid() -> u64 {
+    // Safety: no pointer arguments.
+    unsafe { syscall3(sys::GETPID, 0, 0, 0) }
+}
+
+/// Whether `e` is the "no such file or directory" error.
+pub fn is_enoent(e: u64) -> bool {
+    e == err::ENOENT
+}
+
+/// Whether `e` is the "not permitted" error - i.e. the calling Realm does
+/// not hold the capability the operation requires.
+pub fn is_eperm(e: u64) -> bool {
+    e == err::EPERM
+}
+
+/// Whether `e` is the "invalid argument" error.
+pub fn is_einval(e: u64) -> bool {
+    e == err::EINVAL
+}
+
+/// Whether `e` is the "operation not supported on this object" error.
+pub fn is_enotsup(e: u64) -> bool {
+    e == err::ENOTSUP
+}
+
+/// Writes a `u64` in decimal to standard output.
+///
+/// Exists because `core::fmt` is genuinely dangerous in this environment:
+/// it is deep, it allocates stack freely, and a program with a fixed
+/// stack and no unwinder that overflows inside a formatting call produces
+/// a page fault at a confusing address instead of the number it wanted to
+/// print. Twenty digits and a manual loop cannot do that.
+pub fn write_u64(value: u64) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut remaining = value;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (remaining % 10) as u8;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    let _ = write(&digits[index..]);
 }

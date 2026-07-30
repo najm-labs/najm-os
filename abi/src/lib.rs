@@ -40,6 +40,7 @@
 
 #![no_std]
 
+pub mod archive;
 pub mod layout;
 
 /// Syscall numbers, passed by the caller in RAX.

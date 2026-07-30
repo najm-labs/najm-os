@@ -106,6 +106,14 @@ pub struct Task {
     /// boot path; it becomes reachable the moment processes are tasks,
     /// which is what this milestone does.
     supervisor_rsp: u64,
+    /// The process this task runs, or 0 for a pure kernel task.
+    ///
+    /// Lives on the `Task` rather than in a global "current pid" because
+    /// the scheduler is the only thing that knows which context is on the
+    /// CPU, and a separate global would be a second source of truth that
+    /// could disagree with it - most likely at exactly the moment a
+    /// syscall handler asked "who is calling?" during a switch.
+    pid: u64,
 }
 
 // Safety: the `KernelStack` slot is exclusively owned by this `Task`
@@ -200,6 +208,7 @@ impl Task {
             stack,
             address_space_root: None,
             supervisor_rsp: 0,
+            pid: 0,
         }
     }
 }
@@ -285,6 +294,7 @@ impl Task {
             stack,
             address_space_root: None,
             supervisor_rsp: 0,
+            pid: 0,
         }
     }
 }
@@ -480,9 +490,11 @@ pub fn spawn_process(
     entry: extern "C" fn(*mut u8) -> !,
     context: *mut u8,
     address_space_root: PhysFrame,
+    pid: u64,
 ) {
     let mut task = Task::new_with_context(entry, context);
     task.address_space_root = Some(address_space_root);
+    task.pid = pid;
     let task = Box::new(task);
     x86_64::instructions::interrupts::without_interrupts(|| {
         SCHEDULER.lock().ready_queue.push_back(task);
@@ -794,6 +806,19 @@ pub fn supervisor_slot() -> *mut u64 {
                 ptr
             }
         }
+    })
+}
+
+/// Whether the current task has an address space of its own, and
+/// therefore whether a Ring 3 program running on it can be preempted.
+pub fn current_pid() -> u64 {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SCHEDULER
+            .lock()
+            .current
+            .as_ref()
+            .map(|task| task.pid)
+            .unwrap_or(0)
     })
 }
 

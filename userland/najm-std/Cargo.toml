@@ -1,0 +1,23 @@
+[package]
+name = "najm-std"
+version = "0.1.0"
+edition = "2021"
+description = "The Najm OS userland runtime: safe wrappers around the syscall interface"
+
+# The nearest thing Najm OS has to a C library. It is deliberately tiny -
+# syscall wrappers and nothing else. No allocator, no formatting, no
+# collections: a Ring 3 program here has a fixed stack, no heap, and no
+# unwinder, so anything that allocates or panics-with-formatting would be
+# a liability rather than a convenience.
+#
+# It exists because there are now two userland programs, and the syscall
+# wrappers were copied between them. Two copies of an interface is how the
+# interface stops being one interface.
+[dependencies]
+najm-abi = { path = "../../abi" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

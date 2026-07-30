@@ -271,6 +271,113 @@ fn build_syscall_test_elf() -> Vec<u8> {
     elf
 }
 
+/// Packs a set of `(path, contents)` pairs into a NAR archive.
+///
+/// The format is defined in `abi/src/archive.rs`, which the kernel parses
+/// with - so a change to the layout is a change in one place rather than
+/// two implementations that have to be kept in step by hand.
+///
+/// Directories are synthesized here rather than being listed by the
+/// caller: every path's ancestors are added automatically, so a caller
+/// adding `/bin/hello` does not have to remember to also declare `/bin`.
+/// Forgetting would produce an archive where `readdir("/")` reported
+/// nothing while `/bin/hello` was plainly readable - the kind of
+/// inconsistency that is confusing precisely because both halves look
+/// correct on their own.
+fn build_archive(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const HEADER_SIZE: usize = najm_abi::archive::HEADER_SIZE;
+    const ENTRY_SIZE: usize = najm_abi::archive::ENTRY_SIZE;
+    const MAX_PATH: usize = najm_abi::archive::MAX_PATH;
+
+    // Every ancestor directory of every file, plus the root.
+    let mut directories: BTreeSet<String> = BTreeSet::new();
+    directories.insert("/".to_string());
+    for (path, _) in files {
+        let mut current = *path;
+        while let Some(parent) = najm_abi::archive::parent_of(current.as_bytes()) {
+            let parent = std::str::from_utf8(parent).expect("archive paths must be UTF-8");
+            directories.insert(parent.to_string());
+            current = parent;
+            if current == "/" {
+                break;
+            }
+        }
+    }
+
+    let mut contents: BTreeMap<String, Option<&Vec<u8>>> = BTreeMap::new();
+    for directory in &directories {
+        contents.insert(directory.clone(), None);
+    }
+    for (path, data) in files {
+        assert!(
+            najm_abi::archive::path_is_valid(path.as_bytes()),
+            "archive path {path:?} is not valid - it must be absolute, free of '.' and '..' \
+             components, and at most {MAX_PATH} bytes"
+        );
+        assert!(
+            contents.insert(path.to_string(), Some(data)).is_none(),
+            "archive path {path:?} was added twice"
+        );
+    }
+
+    let entry_count = contents.len();
+    let data_start = HEADER_SIZE + entry_count * ENTRY_SIZE;
+
+    // Lay the data out first so entry offsets are known before the table
+    // is written. Two passes rather than back-patching: back-patching an
+    // offset is exactly the kind of thing that silently writes to the
+    // wrong place after an unrelated layout change.
+    let mut blob = Vec::new();
+    let mut offsets: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for (path, data) in &contents {
+        match data {
+            Some(bytes) => {
+                offsets.insert(path, ((data_start + blob.len()) as u64, bytes.len() as u64));
+                blob.extend_from_slice(bytes);
+            }
+            None => {
+                offsets.insert(path, (0, 0));
+            }
+        }
+    }
+
+    let total_len = data_start + blob.len();
+
+    let mut archive = Vec::with_capacity(total_len);
+    archive.extend_from_slice(&najm_abi::archive::MAGIC);
+    archive.extend_from_slice(&najm_abi::archive::VERSION.to_le_bytes());
+    archive.extend_from_slice(&(entry_count as u32).to_le_bytes());
+    archive.extend_from_slice(&(total_len as u64).to_le_bytes());
+    assert_eq!(archive.len(), HEADER_SIZE, "NAR header size drifted");
+
+    for (path, data) in &contents {
+        let (offset, len) = offsets[path.as_str()];
+        let flags = if data.is_none() {
+            najm_abi::archive::FLAG_DIRECTORY
+        } else {
+            0
+        };
+
+        let entry_start = archive.len();
+        archive.extend_from_slice(&offset.to_le_bytes());
+        archive.extend_from_slice(&len.to_le_bytes());
+        archive.extend_from_slice(&flags.to_le_bytes());
+        archive.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        archive.extend_from_slice(path.as_bytes());
+        // Pad the inline path out to the fixed entry size, so the table
+        // stays indexable rather than needing to be walked.
+        archive.resize(entry_start + ENTRY_SIZE, 0);
+    }
+
+    assert_eq!(archive.len(), data_start, "NAR entry table size drifted");
+    archive.extend_from_slice(&blob);
+    assert_eq!(archive.len(), total_len, "NAR total length drifted");
+
+    archive
+}
+
 fn main() {
     let kernel_path = PathBuf::from(env::var_os("KERNEL_PATH").unwrap_or_else(|| {
         panic!(
@@ -293,7 +400,7 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set by cargo"));
     let bios_image_path = out_dir.join("najm-bios.img");
-    let ramdisk_path = out_dir.join("najm-test.elf");
+    let ramdisk_path = out_dir.join("najm-boot.nar");
 
     // Which program becomes the ramdisk.
     //
@@ -312,6 +419,39 @@ fn main() {
     // `make run` working if the userland crate ever fails to build,
     // which keeps a userland regression from masquerading as a kernel
     // one.
+    // The ramdisk is a NAR archive now, not a bare ELF binary.
+    //
+    // A single-file ramdisk could carry exactly one program and nothing
+    // else - no second binary, no configuration, no assets, and no way
+    // for the kernel to answer "what exists?". The archive turns the
+    // ramdisk into a namespace; see abi/src/archive.rs for the format and
+    // kernel/src/fs.rs for the other end.
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+
+    // The hand-encoded ELF stays, and is now a *file* rather than the
+    // whole ramdisk. It remains the only thing that exercises the ELF
+    // loader's zero-fill path (`p_memsz > p_filesz`), which a
+    // linker-produced binary never reaches - see the note in
+    // userland/hello/linker.ld. An untested zero-fill is an information
+    // leak, so this is coverage worth keeping rather than legacy worth
+    // deleting.
+    files.push(("/bin/bss-test", build_syscall_test_elf()));
+
+    // A plain text file, so the filesystem is proven to serve content the
+    // kernel did not itself produce, and a `read` syscall has something
+    // to return whose exact bytes the test can check.
+    files.push((
+        "/etc/motd",
+        b"Najm OS: Realms are kernel data structures, not conventions.\n".to_vec(),
+    ));
+
+    // A second text file in the same directory, so `readdir` returning
+    // one entry cannot be mistaken for it working.
+    files.push((
+        "/etc/version",
+        format!("najm-os {}\n", env!("CARGO_PKG_VERSION")).into_bytes(),
+    ));
+
     match env::var_os("USERLAND_PATH") {
         Some(path) => {
             let path = PathBuf::from(path);
@@ -321,15 +461,42 @@ fn main() {
                  Did the userland build succeed?",
                 path.display()
             );
-            std::fs::copy(&path, &ramdisk_path)
-                .expect("failed to copy the userland binary into the ramdisk");
+            files.push((
+                "/bin/hello",
+                std::fs::read(&path).expect("failed to read the userland binary"),
+            ));
             println!("cargo:rerun-if-changed={}", path.display());
         }
         None => {
-            std::fs::write(&ramdisk_path, build_syscall_test_elf())
-                .expect("failed to write the test ramdisk ELF");
+            // No compiled userland available. The archive still mounts
+            // and `/bin/bss-test` still runs, so a userland build failure
+            // degrades the boot rather than breaking it - which keeps a
+            // userland regression from looking like a kernel one.
+            println!(
+                "cargo:warning=USERLAND_PATH is not set; the boot archive will contain no \
+                 /bin/hello and the kernel will fall back to /bin/bss-test"
+            );
         }
     }
+
+    // A second userland program, if one was built. Its whole purpose is
+    // to be a *different* binary from /bin/hello, so that "the loader can
+    // run a program" and "the loader can run the program that happens to
+    // be the ramdisk" stop being the same statement.
+    if let Some(path) = env::var_os("USERLAND_FSTEST_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            files.push((
+                "/bin/fstest",
+                std::fs::read(&path).expect("failed to read the fstest binary"),
+            ));
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    println!("cargo:rerun-if-env-changed=USERLAND_FSTEST_PATH");
+
+    std::fs::write(&ramdisk_path, build_archive(&files))
+        .expect("failed to write the boot archive");
     println!("cargo:rerun-if-env-changed=USERLAND_PATH");
 
     bootloader::BiosBoot::new(&kernel_path)

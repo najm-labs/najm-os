@@ -80,6 +80,64 @@ pub struct Process {
     pub name: String,
     pub profile: RealmProfile,
     pub state: ProcessState,
+    /// Open files, indexed by descriptor.
+    ///
+    /// A `Vec<Option<_>>` rather than a map, because descriptors are
+    /// small dense integers by definition and the lowest free one is what
+    /// `open` must return. Descriptors 0, 1 and 2 are permanently `None`
+    /// here - they are the console, handled without a table entry, so
+    /// that a process cannot close stdout and have descriptor 1 handed
+    /// back out as a file.
+    files: Vec<Option<OpenFile>>,
+}
+
+/// One open file: which node, and how far through it the reader is.
+///
+/// The seek position lives here rather than in the `Node` because a node
+/// is shared - two processes opening the same path get the same node and
+/// must not share a cursor.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenFile {
+    pub node: crate::fs::Node,
+    pub position: usize,
+    /// The path this descriptor was opened with.
+    ///
+    /// Carried rather than re-derived from the node, which was the
+    /// original design and was wrong in a way worth recording: every
+    /// directory node is `(offset 0, length 0, is_directory)`, so they
+    /// are *indistinguishable by value*. A reverse lookup by node
+    /// therefore returned whichever directory the map happened to hold
+    /// first - `readdir("/etc")` listed the contents of `/`. The bug did
+    /// not look like a bug, because the answer was a real directory
+    /// listing of a real directory.
+    ///
+    /// A fixed-size inline buffer rather than a `String`, so that an
+    /// `OpenFile` stays `Copy` and the descriptor table needs no
+    /// allocation per open.
+    path: [u8; najm_abi::archive::MAX_PATH],
+    path_len: usize,
+}
+
+impl OpenFile {
+    pub fn new(node: crate::fs::Node, path: &str) -> Option<OpenFile> {
+        let bytes = path.as_bytes();
+        if bytes.len() > najm_abi::archive::MAX_PATH {
+            return None;
+        }
+        let mut buffer = [0u8; najm_abi::archive::MAX_PATH];
+        buffer[..bytes.len()].copy_from_slice(bytes);
+        Some(OpenFile {
+            node,
+            position: 0,
+            path: buffer,
+            path_len: bytes.len(),
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        // Valid UTF-8 by construction: it was built from a `&str`.
+        core::str::from_utf8(&self.path[..self.path_len]).unwrap_or("")
+    }
 }
 
 static PROCESSES: Mutex<BTreeMap<u64, Process>> = Mutex::new(BTreeMap::new());
@@ -129,6 +187,7 @@ pub fn spawn(image: LoadedImage, profile: RealmProfile) -> u64 {
                 name: image.name.clone(),
                 profile: profile.clone(),
                 state: ProcessState::Ready,
+                files: Vec::new(),
             },
         );
     });
@@ -153,16 +212,13 @@ pub fn spawn(image: LoadedImage, profile: RealmProfile) -> u64 {
     // reconstructs it, and the `Drop` at the end of that function is what
     // tears the address space down.
     let context_ptr = Box::into_raw(context) as *mut u8;
-    task::spawn_process(process_entry, context_ptr, {
-        // The task needs the address space root before the context
-        // pointer can be safely dereferenced from the scheduler, so it is
-        // read out here while the `Box` is still local.
-        //
-        // Safety: `context_ptr` was produced by `Box::into_raw` on the
-        // line above and nothing has consumed it yet, so it points at a
-        // live, correctly-typed `ProcessContext`.
-        unsafe { (*(context_ptr as *mut ProcessContext)).address_space.root_frame() }
-    });
+    // Safety: `context_ptr` was produced by `Box::into_raw` on the line
+    // above and nothing has consumed it yet, so it points at a live,
+    // correctly-typed `ProcessContext`. The root frame has to be read out
+    // here, while the pointer is still known-good, because the scheduler
+    // needs it before the task's entry point ever runs.
+    let root = unsafe { (*(context_ptr as *mut ProcessContext)).address_space.root_frame() };
+    task::spawn_process(process_entry, context_ptr, root, pid);
 
     pid
 }
@@ -260,4 +316,105 @@ pub fn snapshot() -> Vec<(u64, String, ProcessState)> {
 /// How many processes have been created since boot.
 pub fn count() -> u64 {
     NEXT_PID.load(Ordering::Relaxed) - 1
+}
+
+/// The Realm profile of the process currently on the CPU, if any.
+///
+/// This is what every capability-gated syscall consults. It returns
+/// `None` when no process is current - which happens for the boot-path
+/// Ring 3 self-tests - and callers must treat that as "no rights", not as
+/// "unrestricted". Defaulting the other way would make the *absence* of a
+/// process the most privileged state in the system.
+pub fn current_profile() -> Option<RealmProfile> {
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return None;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        PROCESSES.lock().get(&pid).map(|p| p.profile)
+    })
+}
+
+/// Runs `f` against the current process's descriptor table.
+///
+/// Returns `None` if there is no current process, for the same reason
+/// `current_profile` does: a context with no process has no descriptor
+/// table, and inventing one would let boot-path code accumulate state
+/// that nothing ever cleans up.
+fn with_files<T>(f: impl FnOnce(&mut Vec<Option<OpenFile>>) -> T) -> Option<T> {
+    let pid = crate::sched::task::current_pid();
+    if pid == 0 {
+        return None;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut table = PROCESSES.lock();
+        let process = table.get_mut(&pid)?;
+        Some(f(&mut process.files))
+    })
+}
+
+/// Records an open file and returns its descriptor.
+///
+/// Always the lowest free slot, which is the POSIX contract and, more
+/// practically, what keeps descriptor numbers small and dense enough for
+/// a `Vec` to be the right structure.
+pub fn open_file(file: OpenFile) -> Option<u64> {
+    with_files(|files| {
+        // Descriptors 0-2 are reserved for the console and never live in
+        // this table, so the search starts past them - see the comment on
+        // `Process::files`.
+        let reserved = najm_abi::fd::FIRST_DYNAMIC as usize;
+        while files.len() < reserved {
+            files.push(None);
+        }
+
+        // The search starts *at* the first dynamic descriptor, not at
+        // zero. Starting at zero was a real bug: slots 0-2 are padded
+        // into the table as `None` so the indices line up, and
+        // `position` dutifully returned index 0 - so `open` handed out
+        // descriptor 0, which `read` then treats as stdin and answers
+        // with "end of input". Every file read returned zero bytes, and
+        // every negative test that expected a *refusal* got a plausible
+        // `Ok(0)` instead. The descriptor was wrong; nothing else was.
+        if let Some(offset) = files[reserved..].iter().position(|slot| slot.is_none()) {
+            let index = reserved + offset;
+            files[index] = Some(file);
+            return index as u64;
+        }
+        files.push(Some(file));
+        (files.len() - 1) as u64
+    })
+}
+
+/// Looks up an open file by descriptor.
+pub fn get_file(descriptor: u64) -> Option<OpenFile> {
+    with_files(|files| files.get(descriptor as usize).copied().flatten()).flatten()
+}
+
+/// Updates an open file's seek position.
+pub fn set_file_position(descriptor: u64, position: usize) -> bool {
+    with_files(|files| match files.get_mut(descriptor as usize) {
+        Some(Some(file)) => {
+            file.position = position;
+            true
+        }
+        _ => false,
+    })
+    .unwrap_or(false)
+}
+
+/// Closes a descriptor, reporting whether it was open.
+///
+/// Reporting matters: silently succeeding on a double close hides a real
+/// bug in the caller, and in a system where descriptors are reused it is
+/// the bug that eventually closes someone else's file.
+pub fn close_file(descriptor: u64) -> bool {
+    with_files(|files| match files.get_mut(descriptor as usize) {
+        Some(slot @ Some(_)) => {
+            *slot = None;
+            true
+        }
+        _ => false,
+    })
+    .unwrap_or(false)
 }

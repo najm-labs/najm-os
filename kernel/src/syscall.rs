@@ -105,6 +105,14 @@ pub extern "C" fn dispatch(number: u64, arg1: u64, arg2: u64, arg3: u64, rsp_at_
         sys::WRITE => sys_write(arg1, arg2, arg3),
         sys::TICKS => crate::arch::x86_64::interrupts::timer_ticks(),
         sys::UPTIME_MS => crate::arch::x86_64::interrupts::uptime_ms(),
+        sys::GETPID => crate::sched::task::current_pid(),
+
+        sys::OPEN => sys_open(arg1, arg2, arg3),
+        sys::READ => sys_read(arg1, arg2, arg3),
+        sys::CLOSE => sys_close(arg1),
+        sys::SEEK => sys_seek(arg1, arg2, arg3),
+        sys::STAT => sys_stat(arg1, arg2, arg3),
+        sys::READDIR => sys_readdir(arg1, arg2, arg3),
 
         unknown => {
             serial_println!(
@@ -199,4 +207,263 @@ fn sys_write(descriptor: u64, ptr: u64, len: u64) -> u64 {
 
     // Same contract as POSIX `write`: the number of bytes taken.
     bytes.len() as u64
+}
+
+/// The longest path a syscall will accept from userland.
+///
+/// Matches the archive's own limit rather than being an independent
+/// number: a path longer than any path that can exist cannot name
+/// anything, so accepting it would only mean spending time to fail.
+const MAX_PATH: usize = najm_abi::archive::MAX_PATH;
+
+/// Reads a path argument from userland and validates it.
+///
+/// Every path-taking syscall goes through this, which is the point: path
+/// handling is where archive and filesystem code has historically gone
+/// wrong (traversal via `..`, ambiguity via `//`, truncation via an
+/// embedded NUL), and one shared entry point means those checks cannot be
+/// present in one syscall and missing in another.
+///
+/// Note it *rejects* rather than normalizes. A path with a `..` in it is
+/// refused outright instead of being resolved, because normalization and
+/// the eventual lookup are two pieces of code that can disagree about
+/// what a string means - and every path-traversal vulnerability is
+/// exactly that disagreement.
+fn read_user_path(ptr: u64, len: u64) -> Result<alloc::string::String, u64> {
+    if len == 0 || len as usize > MAX_PATH {
+        return Err(encode_error(err::EINVAL));
+    }
+    let bytes = crate::mm::memory::copy_from_user(ptr, len as usize)
+        .ok_or(encode_error(err::EFAULT))?;
+
+    if !najm_abi::archive::path_is_valid(&bytes) {
+        return Err(encode_error(err::EINVAL));
+    }
+
+    // Valid per `path_is_valid`, which already guarantees no NUL. UTF-8
+    // is not guaranteed, and a non-UTF-8 path is simply one that names
+    // nothing - lossy conversion produces exactly that outcome without a
+    // separate error path.
+    Ok(alloc::string::String::from(
+        alloc::string::String::from_utf8_lossy(&bytes),
+    ))
+}
+
+/// Whether the calling process holds `right`.
+///
+/// The default for "no current process" is **deny**. That direction
+/// matters: the boot path runs Ring 3 self-tests before any process
+/// exists, and defaulting to allow would make the state with no process
+/// the most privileged state in the system - precisely inverted.
+fn require(right: u64) -> Result<(), u64> {
+    match crate::process::current_profile() {
+        Some(profile) if profile.allows(right) => Ok(()),
+        _ => Err(encode_error(err::EPERM)),
+    }
+}
+
+/// `open(path_ptr, path_len, flags) -> fd`
+fn sys_open(path_ptr: u64, path_len: u64, flags: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::FILE_READ) {
+        return e;
+    }
+
+    // Writing is refused rather than downgraded to read-only. A program
+    // that believes it opened a file for writing, and then believes its
+    // writes succeeded, is worse off than one that was told no at the
+    // first step - the filesystem is read-only (see `crate::fs`), and
+    // pretending otherwise would make that a runtime surprise instead of
+    // an immediate, accurate error.
+    if flags & najm_abi::open_flags::WRITE != 0 {
+        return encode_error(err::ENOTSUP);
+    }
+
+    let path = match read_user_path(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+
+    let Some(node) = crate::fs::lookup(&path) else {
+        return encode_error(err::ENOENT);
+    };
+
+    if flags & najm_abi::open_flags::DIRECTORY != 0 && !node.is_directory {
+        return encode_error(err::ENOTSUP);
+    }
+
+    let Some(open) = crate::process::OpenFile::new(node, &path) else {
+        return encode_error(err::EINVAL);
+    };
+    match crate::process::open_file(open) {
+        Some(descriptor) => descriptor,
+        None => encode_error(err::ENOMEM),
+    }
+}
+
+/// `read(fd, ptr, len) -> bytes read`
+fn sys_read(descriptor: u64, ptr: u64, len: u64) -> u64 {
+    // The console descriptors have no backing file. Reading from stdin
+    // returns 0 - end of input - rather than an error, because "there is
+    // no input" is a true and useful answer, while EBADF would suggest
+    // the descriptor was invalid.
+    if descriptor == fd::STDIN {
+        return 0;
+    }
+    if descriptor == fd::STDOUT || descriptor == fd::STDERR {
+        return encode_error(err::EBADF);
+    }
+
+    let Some(file) = crate::process::get_file(descriptor) else {
+        return encode_error(err::EBADF);
+    };
+    if file.node.is_directory {
+        // A directory is not a byte stream. `readdir` is the operation
+        // that makes sense for one, and silently returning its raw
+        // on-archive representation would be exposing a format detail as
+        // if it were file content.
+        return encode_error(err::ENOTSUP);
+    }
+
+    let want = core::cmp::min(len as usize, crate::mm::memory::MAX_USER_TRANSFER);
+    let mut buffer = alloc::vec![0u8; want];
+    let got = crate::fs::read(&file.node, file.position, &mut buffer);
+
+    // Copy out *before* advancing the position. If the destination
+    // pointer turns out to be invalid, the file's cursor must not have
+    // moved - otherwise a program that passed a bad pointer would find
+    // bytes silently skipped on its next successful read.
+    let Some(written) = crate::mm::memory::copy_to_user(ptr, &buffer[..got]) else {
+        return encode_error(err::EFAULT);
+    };
+
+    crate::process::set_file_position(descriptor, file.position + written);
+    written as u64
+}
+
+/// `close(fd)`
+fn sys_close(descriptor: u64) -> u64 {
+    if crate::process::close_file(descriptor) {
+        0
+    } else {
+        // Reported rather than ignored. In a system that reuses
+        // descriptor numbers, a double close is the bug that eventually
+        // closes a file some *other* part of the program is still using,
+        // and it is invisible unless the first close-of-a-closed-file
+        // says so.
+        encode_error(err::EBADF)
+    }
+}
+
+/// `seek(fd, offset, whence) -> new position`
+fn sys_seek(descriptor: u64, offset: u64, whence: u64) -> u64 {
+    let Some(file) = crate::process::get_file(descriptor) else {
+        return encode_error(err::EBADF);
+    };
+
+    let size = file.node.size();
+    let position = match whence {
+        najm_abi::seek::SET => offset as usize,
+        najm_abi::seek::CURRENT => file.position.saturating_add(offset as usize),
+        najm_abi::seek::END => size.saturating_sub(offset as usize),
+        _ => return encode_error(err::EINVAL),
+    };
+
+    // Clamped to the end of the file rather than allowed past it. A
+    // position beyond EOF is legal in POSIX (it creates a hole on write),
+    // but this filesystem cannot be written to, so the only thing an
+    // out-of-range position could do here is make a subsequent `read`
+    // return 0 for a reason the caller cannot distinguish from a real
+    // end-of-file.
+    let position = core::cmp::min(position, size);
+    if !crate::process::set_file_position(descriptor, position) {
+        return encode_error(err::EBADF);
+    }
+    position as u64
+}
+
+/// `stat(path_ptr, path_len, out_ptr)`
+fn sys_stat(path_ptr: u64, path_len: u64, out_ptr: u64) -> u64 {
+    if let Err(e) = require(najm_abi::capability_bits::FILE_READ) {
+        return e;
+    }
+
+    let path = match read_user_path(path_ptr, path_len) {
+        Ok(path) => path,
+        Err(e) => return e,
+    };
+    let Some(node) = crate::fs::lookup(&path) else {
+        return encode_error(err::ENOENT);
+    };
+
+    let info = najm_abi::FileInfo {
+        size: node.size() as u64,
+        is_directory: u64::from(node.is_directory),
+    };
+
+    // The struct is written through `copy_to_user`, which validates the
+    // destination is writable in the *calling process's* page tables.
+    // Writing it with a raw pointer would be the exact confused-deputy
+    // bug ARCHITECTURE.md section 3b is about, in the other direction:
+    // the kernel writing wherever a program pointed it.
+    //
+    // Safety: `FileInfo` is `#[repr(C)]` and contains only `u64`s, so it
+    // has no padding and no invalid bit patterns - every byte of it is
+    // initialized and meaningful, which is what makes viewing it as bytes
+    // sound.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &info as *const najm_abi::FileInfo as *const u8,
+            core::mem::size_of::<najm_abi::FileInfo>(),
+        )
+    };
+
+    match crate::mm::memory::copy_to_user(out_ptr, bytes) {
+        Some(_) => 0,
+        None => encode_error(err::EFAULT),
+    }
+}
+
+/// `readdir(fd, buf_ptr, buf_len) -> bytes written`
+///
+/// Fills `buf` with the directory's entry names, each terminated by a
+/// NUL. A flat NUL-separated block rather than an array of fixed-size
+/// structs, because entry names vary in length and a fixed-size record
+/// would have to pick a maximum - which is either wastefully large or
+/// silently truncating, and truncation of a *name* is how a program ends
+/// up opening the wrong file.
+fn sys_readdir(descriptor: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    let Some(file) = crate::process::get_file(descriptor) else {
+        return encode_error(err::EBADF);
+    };
+    if !file.node.is_directory {
+        return encode_error(err::ENOTSUP);
+    }
+
+    // The path comes from the descriptor, not from the node. Deriving it
+    // from the node was the original design and was silently wrong: every
+    // directory node is (offset 0, length 0, directory), so a reverse
+    // lookup by node value returned whichever directory the map held
+    // first, and `readdir("/etc")` listed the contents of `/`.
+    let Some(children) = crate::fs::read_dir(file.path()) else {
+        return encode_error(err::ENOENT);
+    };
+
+    let mut out = alloc::vec::Vec::new();
+    for child in children {
+        let name = najm_abi::archive::basename(child.as_bytes());
+        // Stop before overflowing rather than truncating an entry
+        // mid-name: a half-written name is indistinguishable from a real
+        // one, and a caller acting on it would open something that does
+        // not exist or, worse, something that does.
+        if out.len() + name.len() + 1 > buf_len as usize {
+            break;
+        }
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+
+    match crate::mm::memory::copy_to_user(buf_ptr, &out) {
+        Some(written) => written as u64,
+        None => encode_error(err::EFAULT),
+    }
 }

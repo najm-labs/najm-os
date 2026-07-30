@@ -47,6 +47,7 @@ extern crate alloc;
 
 mod arch;
 mod drivers;
+mod fs;
 mod loader;
 mod mm;
 mod process;
@@ -472,9 +473,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         unsafe { core::slice::from_raw_parts(ramdisk_addr as *const u8, ramdisk_len) };
 
     serial_println!(
-        "Najm Kernel: ramdisk found at {:#x}, {} bytes - starting ELF loader",
+        "Najm Kernel: ramdisk found at {:#x}, {} bytes - mounting the boot archive",
         ramdisk_addr,
         ramdisk_len
+    );
+
+    // The ramdisk is a NAR archive rather than a bare ELF binary now, so
+    // this is a *filesystem* mount rather than a pointer handed to the
+    // loader. Everything below loads programs by path.
+    let mounted = match fs::mount(ramdisk) {
+        Ok(count) => count,
+        Err(err) => panic!("could not mount the boot archive: {}", err),
+    };
+    fs::report();
+    selftest::check(
+        "boot archive mounted",
+        mounted >= 4,
+        format_args!(
+            "{} paths in the namespace, including directories synthesized from their children",
+            mounted
+        ),
+    );
+
+    // Reading a file the kernel did not produce, through the same code
+    // path a syscall uses. Checking the *contents* rather than merely
+    // that a read succeeded: a filesystem that returns the right number
+    // of wrong bytes looks identical to one that works.
+    let motd = fs::read_all("/etc/motd").unwrap_or_default();
+    selftest::check(
+        "filesystem read",
+        motd.starts_with(b"Najm OS:"),
+        format_args!(
+            "/etc/motd is {} bytes and begins with the expected text",
+            motd.len()
+        ),
+    );
+
+    // The negative half, checked kernel-side as well as from userland: a
+    // path with a `..` component must not resolve, whatever it would have
+    // resolved to.
+    selftest::check(
+        "path traversal refused",
+        fs::lookup("/etc/../etc/motd").is_none() && fs::lookup("/nonexistent").is_none(),
+        format_args!("'/etc/../etc/motd' and '/nonexistent' both resolve to nothing"),
     );
 
     // Two processes from the same image, each in its own address space.
@@ -494,13 +535,36 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // interleaves with everything else.
     let frames_free_before = mm::frame_pool::stats().0;
 
-    let first = loader::load_image(ramdisk, "hello")
-        .unwrap_or_else(|err| panic!("could not load the ramdisk image: {}", err));
-    let second = loader::load_image(ramdisk, "hello (second instance)")
-        .unwrap_or_else(|err| panic!("could not load the ramdisk image a second time: {}", err));
+    let hello_image = fs::read_all("/bin/hello")
+        .expect("/bin/hello is missing from the boot archive - was USERLAND_PATH set?");
+
+    let first = loader::load_image(&hello_image, "hello")
+        .unwrap_or_else(|err| panic!("could not load /bin/hello: {}", err));
+    let second = loader::load_image(&hello_image, "hello (second instance)")
+        .unwrap_or_else(|err| panic!("could not load /bin/hello a second time: {}", err));
 
     let first_pid = process::spawn(first, realm::HOME);
     let second_pid = process::spawn(second, realm::GAMING);
+
+    // A genuinely different binary, loaded by path out of a namespace
+    // that contains several things. This is what makes the filesystem
+    // load-bearing: while there was one program and it *was* the ramdisk,
+    // "the loader can run a program" and "the loader can run the one
+    // thing the ramdisk contains" were the same statement.
+    let fstest_pid = match fs::read_all("/bin/fstest") {
+        Some(image) => {
+            let loaded = loader::load_image(&image, "fstest")
+                .unwrap_or_else(|err| panic!("could not load /bin/fstest: {}", err));
+            Some(process::spawn(loaded, realm::HOME))
+        }
+        None => {
+            serial_println!(
+                "Najm Kernel: /bin/fstest is not in the boot archive - skipping the filesystem \
+                 syscall tests (set USERLAND_FSTEST_PATH when building the image)"
+            );
+            None
+        }
+    };
 
     // Proof the kernel is not merely *reached* but genuinely healthy
     // afterwards: hardware interrupts still have to be enabled (they are
@@ -579,6 +643,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             frames_free_before, frames_free_after
         ),
     );
+
+    if let Some(pid) = fstest_pid {
+        selftest::check(
+            "filesystem syscalls",
+            process::exit_status(pid)
+                == Some(arch::x86_64::usermode::ProgramExit::Exited(11)),
+            format_args!(
+                "a second, different binary loaded by path exercised open/read/seek/readdir/stat \
+                 and every refusal check, exiting {:?}",
+                process::exit_status(pid)
+            ),
+        );
+    }
 
     for (pid, name, state) in process::snapshot() {
         serial_println!("Najm Kernel: process {} ({}) - {:?}", pid, name, state);

@@ -22,7 +22,7 @@
 #![no_std]
 #![no_main]
 
-mod syscall;
+use najm_std as syscall;
 
 /// Written to at runtime so it lands in `.bss` rather than `.data`.
 ///
